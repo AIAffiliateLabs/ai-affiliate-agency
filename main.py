@@ -2,6 +2,15 @@
 import os
 import time
 import json
+import re
+import ipaddress
+import socket
+import ssl
+from html.parser import HTMLParser
+from urllib.parse import urlparse, urljoin
+from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.error import URLError, HTTPError
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -16,7 +25,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered autonomous affiliate research platform",
-    version="6.0.0"
+    version="7.0.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -175,6 +184,198 @@ def collect_market_research(niche: str):
     return collected_results
 
 
+
+
+# ==========================================
+# SAFE OFFICIAL-WEBSITE INSPECTION
+# ==========================================
+
+MAX_PAGE_BYTES = 450_000
+PAGE_TIMEOUT_SECONDS = 8
+MAX_INITIAL_PAGES = 10
+MAX_AFFILIATE_LINKS_PER_DOMAIN = 2
+
+AFFILIATE_TERMS = (
+    "affiliate", "partner", "partnership", "referral",
+    "commission", "ambassador", "creator"
+)
+
+
+def _validate_public_http_url(url: str):
+    """Allow only public HTTP(S) destinations; block local/private targets."""
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("Only public HTTP/HTTPS URLs are allowed.")
+
+    host = parsed.hostname.lower().rstrip(".")
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise ValueError("Local hostnames are not allowed.")
+
+    try:
+        addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as exc:
+        raise ValueError("Hostname could not be resolved.") from exc
+
+    if not addresses:
+        raise ValueError("Hostname has no public address.")
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0].split("%")[0])
+        if not ip.is_global:
+            raise ValueError("Private, reserved or non-public IP destinations are blocked.")
+
+    return parsed
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        absolute = urljoin(req.full_url, newurl)
+        _validate_public_http_url(absolute)
+        return super().redirect_request(req, fp, code, msg, headers, absolute)
+
+
+class _PageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title_parts = []
+        self.text_parts = []
+        self.links = []
+        self.in_title = False
+        self.skip_depth = 0
+        self.meta_description = ""
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "title":
+            self.in_title = True
+        if tag in ("script", "style", "noscript", "svg"):
+            self.skip_depth += 1
+        if tag == "meta" and attrs.get("name", "").lower() == "description":
+            self.meta_description = attrs.get("content", "")
+        if tag == "a" and attrs.get("href"):
+            self.links.append((attrs["href"], attrs.get("aria-label", "")))
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self.in_title = False
+        if tag in ("script", "style", "noscript", "svg") and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_data(self, data):
+        if self.skip_depth:
+            return
+        clean = " ".join(data.split())
+        if not clean:
+            return
+        if self.in_title:
+            self.title_parts.append(clean)
+        self.text_parts.append(clean)
+
+
+def inspect_public_page(url: str):
+    """Fetch a small amount of public HTML without executing scripts."""
+    try:
+        _validate_public_http_url(url)
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "AffiliateIntelligenceResearchBot/1.0 (+public-page-inspection)",
+                "Accept": "text/html,application/xhtml+xml"
+            }
+        )
+        opener = build_opener(_SafeRedirectHandler())
+        with opener.open(request, timeout=PAGE_TIMEOUT_SECONDS) as response:
+            final_url = response.geturl()
+            _validate_public_http_url(final_url)
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "html" not in content_type and "xhtml" not in content_type:
+                return {
+                    "requested_url": url,
+                    "final_url": final_url,
+                    "status": "skipped_non_html",
+                    "reason": "Response was not HTML."
+                }
+            raw = response.read(MAX_PAGE_BYTES + 1)
+            if len(raw) > MAX_PAGE_BYTES:
+                raw = raw[:MAX_PAGE_BYTES]
+            charset = response.headers.get_content_charset() or "utf-8"
+            html = raw.decode(charset, errors="replace")
+
+        parser = _PageParser()
+        parser.feed(html)
+        page_text = re.sub(r"\s+", " ", " ".join(parser.text_parts)).strip()
+        return {
+            "requested_url": url,
+            "final_url": final_url,
+            "status": "inspected",
+            "title": " ".join(parser.title_parts)[:250],
+            "description": parser.meta_description[:500],
+            "text_excerpt": page_text[:6500],
+            "links": parser.links[:250]
+        }
+    except Exception as exc:
+        return {
+            "requested_url": url,
+            "status": "fetch_failed",
+            "reason": str(exc)[:300]
+        }
+
+
+def collect_official_site_evidence(search_results):
+    """
+    Inspect a bounded set of search-result pages and affiliate-related links.
+    A fetched page is evidence, not automatic proof that a domain is official.
+    """
+    inspected = []
+    seen = set()
+    candidates = []
+
+    for item in search_results:
+        url = item.get("url")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        candidates.append(url)
+        if len(candidates) >= MAX_INITIAL_PAGES:
+            break
+
+    for url in candidates:
+        page = inspect_public_page(url)
+        inspected.append(page)
+
+    affiliate_candidates = []
+    for page in inspected:
+        if page.get("status") != "inspected":
+            continue
+        base = page.get("final_url") or page.get("requested_url")
+        base_host = urlparse(base).hostname
+        for href, anchor in page.get("links", []):
+            combined = f"{href} {anchor}".lower()
+            if any(term in combined for term in AFFILIATE_TERMS):
+                candidate = urljoin(base, href)
+                if urlparse(candidate).hostname == base_host and candidate not in seen:
+                    seen.add(candidate)
+                    affiliate_candidates.append(candidate)
+
+    # Keep the follow-up inspection small and same-domain.
+    for url in affiliate_candidates[:MAX_AFFILIATE_LINKS_PER_DOMAIN * 5]:
+        inspected.append(inspect_public_page(url))
+
+    # Remove raw link lists from the evidence sent to Gemini to keep prompts compact.
+    compact = []
+    for page in inspected:
+        item = dict(page)
+        item.pop("links", None)
+        compact.append(item)
+
+    return {
+        "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+        "pages_inspected": len(compact),
+        "pages": compact
+    }
+
+
 # ==========================================
 # AGENT 1 — MARKET DISCOVERY
 # ==========================================
@@ -260,76 +461,71 @@ Return a structured professional report.
 # AGENT 2 — VERIFICATION
 # ==========================================
 
-def run_verification_agent(discovery_report, web_results):
+def run_verification_agent(discovery_report, web_results, official_site_evidence):
 
-    research_data = json.dumps(
-        web_results,
-        ensure_ascii=False,
-        indent=2
-    )
+    research_data = json.dumps(web_results, ensure_ascii=False, indent=2)
+    inspected_data = json.dumps(official_site_evidence, ensure_ascii=False, indent=2)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence.
+You are the Verification Agent of Affiliate Intelligence, version 7.
 
-Your job is to critically examine the opportunities
-identified by the Market Discovery Agent.
+Your job is to assess each opportunity using BOTH search evidence and
+the public website pages that the system actually fetched.
 
 DISCOVERY REPORT:
 {discovery_report}
 
-AVAILABLE SEARCH EVIDENCE:
+SEARCH EVIDENCE:
 {research_data}
 
-For every identified opportunity, examine:
+DIRECTLY INSPECTED PUBLIC PAGE EVIDENCE:
+{inspected_data}
 
-1. Is the company identifiable from the evidence?
-2. Is the product or service identifiable?
-3. Is there evidence of an affiliate program?
-4. Is there evidence that the program is currently accepting
-   applications?
-5. Is there evidence of commission conditions?
-6. Is there evidence of cookie duration?
-7. Is the supplied website likely to be the official website?
-8. What information is missing?
-9. What should be checked directly on the official website?
+For every opportunity, report:
+1. Company and product/service.
+2. Candidate official domain and why it appears to belong to the company.
+3. Whether an affiliate/partner/referral page was directly inspected.
+4. Evidence of program availability or application status.
+5. Commission rate/model, only if explicitly shown.
+6. Cookie duration, only if explicitly shown.
+7. Important eligibility, geography, payout or program terms, only if shown.
+8. Source URLs and short exact evidence excerpts.
+9. What remains unknown or contradictory.
 
-Use these evidence labels:
-
-- Supported by search evidence
-- Partially supported
+Use exactly one of these verification statuses:
+- Official affiliate page inspected — program evidence found
+- Official website inspected — affiliate program not found in inspected pages
+- Third-party evidence only
 - Not verified
 - Conflicting evidence
 
-CRITICAL RULES:
+CRITICAL EVIDENCE RULES:
+- A fetched page is not automatically an official page. Assess the domain carefully.
+- A search snippet is not direct website verification.
+- Do not say a program is active or accepting applications unless the inspected
+  page explicitly supports that conclusion.
+- Do not infer commissions, cookie durations, payouts or terms.
+- If a value is absent, write "Not stated on inspected pages".
+- If a page could not be fetched, say so.
+- "Not found in inspected pages" does NOT mean the program does not exist.
+- Do not invent URLs, quotes, dates or facts.
+- Keep facts, interpretation and unknowns clearly separated.
 
-You have search-result information only.
-You have not independently opened or inspected
-the official websites.
-
-Do not claim that you visited an official website.
-Do not claim that an affiliate program is active
-unless the supplied evidence explicitly supports it.
-
-A search result mentioning a product is not proof
-of an active affiliate program.
-
-Never invent commissions, cookie durations,
-program terms or application status.
-
-For each opportunity provide:
-- Company and product
-- Evidence found
-- Affiliate program evidence
-- Commission evidence
-- Cookie duration evidence
+For each opportunity include:
+- Company / product
+- Candidate official website
+- Affiliate page URL (if actually present in inspected evidence)
+- Direct inspection result
+- Program/application status
+- Commission
+- Cookie duration
+- Terms and eligibility
+- Evidence excerpts with source URLs
 - Verification status
-- Missing information
-- Recommended verification steps
+- Missing information / next checks
 
-Finish with a list of opportunities that need
-the least additional verification.
-
-Return a structured verification report.
+Finish with a ranked shortlist based on strength of evidence, not estimated earnings.
+Return a structured professional report.
 """
 
     return generate_ai_response(prompt)
@@ -589,6 +785,9 @@ def run_agent_workflow(request: ResearchRequest):
             )
         )
 
+    # Inspect a bounded number of public pages before verification.
+    official_site_evidence = collect_official_site_evidence(web_results)
+
     # Agent 1
     discovery = run_discovery_agent(
         request,
@@ -598,7 +797,8 @@ def run_agent_workflow(request: ResearchRequest):
     # Agent 2
     verification = run_verification_agent(
         discovery,
-        web_results
+        web_results,
+        official_site_evidence
     )
 
     # Agent 3
@@ -624,7 +824,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "6.0.0",
+        "version": "7.0.0",
         "workflow": "Five-Agent Affiliate Intelligence System",
         "model": MODEL_NAME,
         "niche": request.niche,
@@ -653,7 +853,8 @@ def run_agent_workflow(request: ResearchRequest):
             }
         },
 
-        "source_results": web_results
+        "source_results": web_results,
+        "official_site_evidence": official_site_evidence
     }
 
 
@@ -666,7 +867,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "6.0.0",
+        "version": "7.0.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
