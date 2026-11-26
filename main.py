@@ -20,13 +20,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.2: semantic commission matching, deterministic evidence enforcement, agent-output blocking, and guarded strategy fallback.
+# v8.3: version-consistent reports, semantic evidence enforcement, cross-agent consistency checks, and guarded strategy fallback.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="8.2.0"
+    version="8.3.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -948,24 +948,63 @@ def enforce_evidence_ledger(records):
     return normalized, enforcement_findings
 
 
+def _report_sentences(line):
+    """Split a report line into sentence-like units for claim-level checks."""
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", str(line or "")) if part.strip()]
+
+
+def _line_has_unsupported_term_claim(line, candidate):
+    """Detect numeric and qualitative term claims that contradict the evidence ledger."""
+    reasons = []
+    commission = candidate.get("commission", "Not verified")
+    cookie = candidate.get("cookie_duration", "Not verified")
+
+    for sentence in _report_sentences(line):
+        if commission == "Not verified" and _commission_percentage_from_sentence(sentence):
+            reasons.append("commission is Not verified")
+        if cookie == "Not verified":
+            has_cookie_context = bool(re.search(r"(?i)\bcookie\b", sentence))
+            has_duration = bool(re.search(r"(?i)\b\d{1,4}\s*(?:days?|weeks?|months?)\b", sentence))
+            if has_cookie_context and has_duration:
+                reasons.append("cookie duration is Not verified")
+            elif has_cookie_context and re.search(
+                r"(?i)\b(?:long|extended|generous|robust|attractive|lengthy|favorable|favourable)\s+cookie\b|\bcookie\s+(?:window|duration|period)\s+(?:is\s+)?(?:long|extended|generous|robust|attractive|favorable|favourable)\b",
+                sentence
+            ):
+                reasons.append("qualitative cookie-duration claim is unsupported because cookie duration is Not verified")
+
+    return list(dict.fromkeys(reasons))
+
+
+def _normalize_report_version(report_text):
+    """Replace stale self-reported platform versions in generated agent prose."""
+    text = str(report_text or "")
+    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-2](?:\.0)?", r"\g<1>8.3.0", text)
+    text = re.sub(r"(?i)(\bversion\s+)8\.[0-2](?:\.0)?", r"\g<1>8.3.0", text)
+    text = re.sub(r"(?i)(\bv)8\.[0-2](?:\.0)?\b", r"\g<1>8.3.0", text)
+    return text
+
+
 def _sanitize_agent_report(report_text, records, agent_name):
-    """Block report lines that state unsupported numeric terms for a named candidate."""
+    """Block report lines that state unsupported numeric or qualitative terms."""
     if not report_text:
         return report_text, []
+    report_text = _normalize_report_version(report_text)
     lines = str(report_text).splitlines()
     findings = []
-    active_candidate = None
     by_name = {str(r.get("candidate", "")).lower(): r for r in records or []}
     names = sorted([n for n in by_name if n], key=len, reverse=True)
     output = []
+    active_candidate = None
+
     for line in lines:
-        lower = line.lower()
         for name in names:
             if re.search(r"(?i)(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", line):
                 active_candidate = name
                 break
         candidate = by_name.get(active_candidate) if active_candidate else None
         blocked_reasons = []
+
         if candidate:
             status = candidate.get("verification_status", "Not verified")
             if status in ("Third-party evidence only", "Not verified",
@@ -975,14 +1014,9 @@ def _sanitize_agent_report(report_text, records, agent_name):
                     r"(?i)\b(?:not|never|cannot|can't|unverified|unknown|unclear|provisional|excluded|do not)\b", line
                 ):
                     blocked_reasons.append("candidate is not verified and cannot be promoted as a verified recommendation")
-            if candidate.get("commission", "Not verified") == "Not verified" and re.search(
-                r"(?i)(commission|commissions|referral fee|payout).{0,100}\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?\s*%.{0,100}(commission|referral fee|payout)", line
-            ):
-                blocked_reasons.append("commission is Not verified")
-            if candidate.get("cookie_duration", "Not verified") == "Not verified" and re.search(
-                r"(?i)cookie.{0,80}\d+\s*(days?|weeks?|months?)|\d+\s*(days?|weeks?|months?).{0,80}cookie", line
-            ):
-                blocked_reasons.append("cookie duration is Not verified")
+
+            blocked_reasons.extend(_line_has_unsupported_term_claim(line, candidate))
+
         if blocked_reasons:
             findings.append({
                 "candidate": candidate.get("candidate"),
@@ -992,10 +1026,11 @@ def _sanitize_agent_report(report_text, records, agent_name):
             })
             output.append(
                 f"[BLOCKED BY EVIDENCE ENFORCEMENT — {candidate.get('candidate')}: "
-                f"{'; '.join(blocked_reasons)}] Numeric claim withheld."
+                f"{'; '.join(blocked_reasons)}] Claim withheld."
             )
         else:
             output.append(line)
+
     return "\n".join(output), findings
 
 
@@ -1006,7 +1041,7 @@ def build_enforcement_summary(records, ledger_findings, report_findings):
         "agent_claims_blocked": len(report_findings or []),
         "ledger_findings": ledger_findings or [],
         "blocked_agent_claims": report_findings or [],
-        "rule": "Only exact numeric terms supported by focused candidate-host program-page excerpts remain verified. Commission percentages must be grammatically tied to commission; unrelated percentages such as conversion lifts are rejected. Unsupported report lines are replaced before downstream use."
+        "rule": "Only exact numeric terms supported by focused candidate-host program-page excerpts remain verified. Commission percentages must be grammatically tied to commission; unrelated percentages such as conversion lifts are rejected. Unsupported numeric and qualitative term claims are replaced before downstream use."
     }
 
 
@@ -1045,7 +1080,7 @@ def _candidate_claim_lines(report_text, candidate_name):
 
 
 def build_agent_consistency_audit(records, agent_reports):
-    """Validate source authority, candidate identity, numeric terms and report claims."""
+    """Validate evidence authority and consistency across all downstream agent reports."""
     findings = []
     records = records or []
     agent_reports = agent_reports or {}
@@ -1055,41 +1090,43 @@ def build_agent_consistency_audit(records, agent_reports):
         status = record.get("verification_status", "Not verified")
         urls = record.get("discovery_source_urls", [])
         if not urls:
-            findings.append({"candidate": name, "agent": "evidence_ledger", "ledger_status": status,
-                             "issue": "No discovery source URL retained; manual source recovery recommended",
-                             "severity": "source_gap"})
+            findings.append({
+                "candidate": name, "agent": "evidence_ledger", "ledger_status": status,
+                "issue": "No discovery source URL retained; manual source recovery recommended",
+                "severity": "source_gap"
+            })
 
-        official_host = _host(record.get("official_url_candidate", ""))
         for term_name, field_name in (("commission", "commission"), ("cookie_duration", "cookie_duration")):
             value = record.get(field_name, "Not verified")
             if not value or value == "Not verified":
                 continue
-            matches = [e for e in (record.get("term_evidence") or [])
-                       if e.get("term") == term_name and str(e.get("value", "")).replace(" ", "") == str(value).replace(" ", "")]
-            valid = _term_evidence_is_authoritative(record, term_name, value)
-            bad_sources = [e.get("evidence_url", "missing URL") for e in matches] if not valid else []
-            if not valid:
+            matches = [
+                e for e in (record.get("term_evidence") or [])
+                if e.get("term") == term_name
+                and str(e.get("value", "")).replace(" ", "") == str(value).replace(" ", "")
+            ]
+            if not _term_evidence_is_authoritative(record, term_name, value):
                 findings.append({
                     "candidate": name, "agent": "evidence_ledger", "ledger_status": status,
                     "issue": f"{field_name} is not supported by a focused excerpt on the candidate-host program page; value must be Not verified",
                     "severity": "unsupported_term", "reported_value": value,
-                    "evidence_urls_reviewed": bad_sources
+                    "evidence_urls_reviewed": [e.get("evidence_url", "missing URL") for e in matches]
                 })
 
         for agent_name, report in agent_reports.items():
             for line in _candidate_claim_lines(report, name):
-                lower = line.lower()
-                # Check numerical commission claims when ledger commission is unknown.
-                if record.get("commission", "Not verified") == "Not verified":
-                    if re.search(r"(?i)(commission|referral fee|payout).{0,80}\d+(?:\.\d+)?\s*%|\d+(?:\.\d+)?\s*%.{0,80}(commission|referral fee|payout)", line):
-                        findings.append({"candidate": name, "agent": agent_name, "ledger_status": status,
-                                         "issue": "Agent report states a numeric commission while ledger commission is Not verified",
-                                         "claim_excerpt": line[:350], "severity": "unsupported_agent_term"})
-                if record.get("cookie_duration", "Not verified") == "Not verified":
-                    if re.search(r"(?i)cookie.{0,60}\d+\s*(days?|weeks?|months?)|\d+\s*(days?|weeks?|months?).{0,60}cookie", line):
-                        findings.append({"candidate": name, "agent": agent_name, "ledger_status": status,
-                                         "issue": "Agent report states a cookie duration while ledger cookie duration is Not verified",
-                                         "claim_excerpt": line[:350], "severity": "unsupported_agent_term"})
+                for reason in _line_has_unsupported_term_claim(line, record):
+                    findings.append({
+                        "candidate": name, "agent": agent_name, "ledger_status": status,
+                        "issue": reason,
+                        "claim_excerpt": line[:350],
+                        "severity": "unsupported_agent_term"
+                    })
+
+                caveat_present = bool(re.search(
+                    r"(?i)\b(?:not|never|cannot|can't|unable to|unverified|unknown|unclear|not confirmed|not established|do not|provisional|excluded|subject to confirmation)\b",
+                    line
+                ))
 
                 if status == "Program discontinued — do not promote":
                     restricted = re.compile(r"(?i)\b(?:active affiliate program|active affiliate offer|currently accepting applications|open for applications|top recommendation|recommended for promotion|viable affiliate opportunity)\b")
@@ -1099,24 +1136,32 @@ def build_agent_consistency_audit(records, agent_reports):
                     restricted = re.compile(r"(?i)\b(?:verified affiliate program|verified commission|verified cookie duration|currently accepting applications|open for applications|confirmed active affiliate program)\b")
                 else:
                     restricted = re.compile(r"(?i)\b(?:currently accepting applications|open for applications|applications are open)\b")
-                caveat_present = bool(re.search(
-                    r"(?i)\b(?:not|never|cannot|can't|unable to|unverified|unknown|unclear|not confirmed|not established|do not|provisional|excluded)\b",
-                    line
-                ))
+
                 if restricted.search(line) and not caveat_present:
-                    findings.append({"candidate": name, "agent": agent_name, "ledger_status": status,
-                                     "issue": "Explicit candidate-level claim may conflict with evidence ledger",
-                                     "claim_excerpt": line[:350], "severity": "claim_conflict"})
+                    findings.append({
+                        "candidate": name, "agent": agent_name, "ledger_status": status,
+                        "issue": "Explicit candidate-level claim may conflict with evidence ledger",
+                        "claim_excerpt": line[:350], "severity": "claim_conflict"
+                    })
+
                 if status in ("Third-party evidence only", "Not verified",
                               "Candidate-host website inspected — affiliate program not found in inspected pages",
                               "B2B/agency/technology partnership observed — publisher affiliate program not established"):
                     if re.search(r"(?i)\b(?:verified shortlist|top recommendation|recommended opportunity|ranked (?:#?\d+|first|second|third)|ranked among verified|verified ranking)\b", line) and not caveat_present:
-                        findings.append({"candidate": name, "agent": agent_name, "ledger_status": status,
-                                         "issue": "Unverified candidate promoted in a verified ranking or recommendation",
-                                         "claim_excerpt": line[:350], "severity": "claim_conflict"})
+                        findings.append({
+                            "candidate": name, "agent": agent_name, "ledger_status": status,
+                            "issue": "Unverified candidate promoted in a verified ranking or recommendation",
+                            "claim_excerpt": line[:350], "severity": "claim_conflict"
+                        })
 
-    conflict_count = sum(1 for x in findings if x.get("severity") in ("claim_conflict", "unsupported_agent_term"))
-    source_gap_count = sum(1 for x in findings if x.get("severity") == "source_gap")
+    conflict_count = sum(
+        1 for item in findings
+        if item.get("severity") in ("claim_conflict", "unsupported_agent_term")
+    )
+    source_gap_count = sum(1 for item in findings if item.get("severity") == "source_gap")
+    unsupported_term_count = sum(
+        1 for item in findings if item.get("severity") == "unsupported_term"
+    )
     return {
         "status": "review_required" if findings else "no_conflicts_detected_by_rules",
         "checks_run": len(records) * max(1, len(agent_reports)),
@@ -1124,10 +1169,32 @@ def build_agent_consistency_audit(records, agent_reports):
         "agent_reports_checked": len(agent_reports),
         "claim_conflicts": conflict_count,
         "source_gaps": source_gap_count,
-        "unsupported_terms": sum(1 for x in findings if x.get("severity") == "unsupported_term"),
+        "unsupported_terms": unsupported_term_count,
         "findings": findings,
-        "audit_method": "Candidate-host identity check; exact term/value/excerpt/source-host validation; commission percentages must be grammatically linked to the word commission (not merely share a sentence with it); cookie duration must be explicitly linked to cookie; candidate-level status claims checked line by line.",
-        "note": "Rule-based checks cannot authenticate legal domain ownership or understand every paraphrase. A clean audit is not proof that all claims are correct."
+        "audit_method": (
+            "Candidate-host identity and source-host checks; exact-value semantic evidence matching; "
+            "sentence-level commission and cookie validation; unsupported qualitative cookie claims; "
+            "candidate-level program-status and verified-ranking consistency checks."
+        ),
+        "note": (
+            "Rule-based checks cannot authenticate legal domain ownership or understand every paraphrase. "
+            "A clean audit is not proof that all claims are correct."
+        )
+    }
+
+
+def build_report_metadata(agent_reports):
+    """Report stale agent version labels without silently treating them as evidence issues."""
+    stale = []
+    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-2](?:\.0)?\b")
+    for agent_name, report in (agent_reports or {}).items():
+        if version_pattern.search(str(report or "")):
+            stale.append(agent_name)
+    return {
+        "application_version": "8.3.0",
+        "agent_reports_with_stale_version_labels": stale,
+        "status": "passed" if not stale else "review_required",
+        "version_policy": "All agent prompts and generated report version labels must match the running application version."
     }
 
 def _records_json(records):
@@ -1183,7 +1250,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 8.0.
+You are the Market Discovery Agent of Affiliate Intelligence, version 8.3.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1308,7 +1375,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 8.0.
+You are the Verification Agent of Affiliate Intelligence, version 8.3.
 
 V8 STRICT EVIDENCE RULES:
 - The structured ledger is deterministic and authoritative; do not upgrade it.
@@ -1861,7 +1928,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.2.0",
+            "version": "8.3.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1883,6 +1950,9 @@ def run_agent_workflow(request: ResearchRequest):
                 structured_evidence_records,
                 {name: item.get("report", "") for name, item in completed.items()}
             ),
+            "report_metadata": build_report_metadata(
+                {name: item.get("report", "") for name, item in completed.items()}
+            ),
             "source_results": web_results
         }
 
@@ -1891,7 +1961,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.2.0",
+            "version": "8.3.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1911,6 +1981,9 @@ def run_agent_workflow(request: ResearchRequest):
             "evidence_enforcement": {"status": "partial_not_finalized", "note": "Workflow stopped before all agents completed."},
             "agent_consistency_audit": build_agent_consistency_audit(
                 structured_evidence_records,
+                {name: item.get("report", "") for name, item in completed.items()}
+            ),
+            "report_metadata": build_report_metadata(
                 {name: item.get("report", "") for name, item in completed.items()}
             ),
             "source_results": web_results
@@ -1943,9 +2016,12 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "8.2.0",
+        "version": "8.3.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
+        "report_metadata": build_report_metadata({
+            name: item.get("report", "") for name, item in completed.items()
+        }),
         "report_generated_at_utc": report_generated_at_utc,
         "workflow": "Five-Agent Affiliate Intelligence System",
         "model": MODEL_NAME,
@@ -1970,7 +2046,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "8.2.0",
+        "version": "8.3.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
