@@ -25,7 +25,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered autonomous affiliate research platform",
-    version="7.0.0"
+    version="7.1.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -74,9 +74,15 @@ def get_gemini_client():
 
 
 def generate_ai_response(prompt: str):
+    """
+    Call Gemini with bounded exponential backoff for transient 503/429 errors.
+    The function never switches models or enables billing automatically.
+    """
     client = get_gemini_client()
+    max_attempts = 4
+    last_error = None
 
-    for attempt in range(2):
+    for attempt in range(max_attempts):
         try:
             response = client.models.generate_content(
                 model=MODEL_NAME,
@@ -84,37 +90,61 @@ def generate_ai_response(prompt: str):
             )
 
             if not response.text:
-                raise Exception("Gemini returned an empty response.")
+                raise RuntimeError("Gemini returned an empty response.")
 
             return response.text
 
         except Exception as error:
+            last_error = error
             error_message = str(error)
-            print(f"Gemini error: {error_message}")
+            print(
+                f"Gemini error on attempt {attempt + 1}/{max_attempts}: "
+                f"{error_message}"
+            )
 
-            if "429" in error_message:
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        "Gemini quota or rate limit reached. "
-                        "Try again later."
-                    )
-                )
+            is_unavailable = "503" in error_message or "UNAVAILABLE" in error_message
+            is_rate_limited = "429" in error_message or "RESOURCE_EXHAUSTED" in error_message
 
-            if "503" in error_message:
-                if attempt == 0:
-                    time.sleep(3)
+            if is_unavailable or is_rate_limited:
+                if attempt < max_attempts - 1:
+                    # 3s, 6s, 12s; bounded to avoid long request hangs.
+                    wait_seconds = min(3 * (2 ** attempt), 12)
+                    print(f"Retrying Gemini request in {wait_seconds} seconds.")
+                    time.sleep(wait_seconds)
                     continue
+
+                if is_rate_limited:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=(
+                            "Gemini rate limit or free-tier quota was reached "
+                            "after automatic retries. Wait and try again. "
+                            "No billing changes were made."
+                        )
+                    )
 
                 raise HTTPException(
                     status_code=503,
-                    detail="Gemini is temporarily unavailable."
+                    detail=(
+                        "Gemini is experiencing high demand and remained "
+                        "unavailable after automatic retries. Please try again "
+                        "later. Completed agent results, if any, are preserved "
+                        "in the workflow error response."
+                    )
                 )
 
             raise HTTPException(
                 status_code=502,
-                detail="Gemini request failed. Check Railway logs."
+                detail=(
+                    "Gemini request failed for a non-retryable reason. "
+                    "Check Railway logs for the underlying error."
+                )
             )
+
+    raise HTTPException(
+        status_code=503,
+        detail=f"Gemini request failed after retries: {str(last_error)[:250]}"
+    )
 
 
 # ==========================================
@@ -773,86 +803,112 @@ Return a professional executive strategy report.
 # ==========================================
 
 def run_agent_workflow(request: ResearchRequest):
-
+    """
+    Run agents sequentially and preserve completed outputs if a later agent fails.
+    """
     web_results = collect_market_research(request.niche)
 
     if not web_results:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Web search returned no results. "
-                "Please try again later."
-            )
+            detail="Web search returned no results. Please try again later."
         )
 
-    # Inspect a bounded number of public pages before verification.
-    official_site_evidence = collect_official_site_evidence(web_results)
+    completed = {}
+    current_agent = "Market Discovery Agent"
 
-    # Agent 1
-    discovery = run_discovery_agent(
-        request,
-        web_results
-    )
+    try:
+        discovery = run_discovery_agent(request, web_results)
+        completed["market_discovery"] = {
+            "status": "completed",
+            "report": discovery
+        }
 
-    # Agent 2
-    verification = run_verification_agent(
-        discovery,
-        web_results,
-        official_site_evidence
-    )
+        current_agent = "Verification Agent"
+        official_site_evidence = collect_official_site_evidence(web_results)
+        verification = run_verification_agent(
+            discovery,
+            web_results,
+            official_site_evidence
+        )
+        completed["verification"] = {
+            "status": "completed",
+            "report": verification
+        }
 
-    # Agent 3
-    competition = run_competition_agent(
-        discovery,
-        verification
-    )
+        current_agent = "Competition Analysis Agent"
+        competition = run_competition_agent(discovery, verification)
+        completed["competition"] = {
+            "status": "completed",
+            "report": competition
+        }
 
-    # Agent 4
-    financial = run_financial_agent(
-        discovery,
-        verification
-    )
+        current_agent = "Financial Analyst Agent"
+        financial = run_financial_agent(discovery, verification)
+        completed["financial_analyst"] = {
+            "status": "completed",
+            "report": financial
+        }
 
-    # Agent 5
-    strategy = run_strategy_agent(
-        discovery,
-        verification,
-        competition,
-        financial
-    )
+        current_agent = "Chief Strategy Agent"
+        strategy = run_strategy_agent(
+            discovery,
+            verification,
+            competition,
+            financial
+        )
+        completed["chief_strategy"] = {
+            "status": "completed",
+            "report": strategy
+        }
+
+    except HTTPException as error:
+        # Return HTTP 200 with explicit partial status so completed work is not lost.
+        return {
+            "status": "partial",
+            "project": "Affiliate Intelligence",
+            "version": "7.1.0",
+            "workflow": "Five-Agent Affiliate Intelligence System",
+            "model": MODEL_NAME,
+            "niche": request.niche,
+            "search_results_found": len(web_results),
+            "failed_agent": current_agent,
+            "error": {
+                "status_code": error.status_code,
+                "detail": error.detail
+            },
+            "completed_agents": completed,
+            "source_results": web_results
+        }
+
+    except Exception as error:
+        print(f"Unexpected workflow error in {current_agent}: {error}")
+        return {
+            "status": "partial",
+            "project": "Affiliate Intelligence",
+            "version": "7.1.0",
+            "workflow": "Five-Agent Affiliate Intelligence System",
+            "model": MODEL_NAME,
+            "niche": request.niche,
+            "search_results_found": len(web_results),
+            "failed_agent": current_agent,
+            "error": {
+                "status_code": 500,
+                "detail": "Unexpected agent error. Check Railway logs."
+            },
+            "completed_agents": completed,
+            "source_results": web_results
+        }
 
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "7.0.0",
+        "version": "7.1.0",
         "workflow": "Five-Agent Affiliate Intelligence System",
         "model": MODEL_NAME,
         "niche": request.niche,
         "search_results_found": len(web_results),
-
-        "agents": {
-            "market_discovery": {
-                "status": "completed",
-                "report": discovery
-            },
-            "verification": {
-                "status": "completed",
-                "report": verification
-            },
-            "competition": {
-                "status": "completed",
-                "report": competition
-            },
-            "financial_analyst": {
-                "status": "completed",
-                "report": financial
-            },
-            "chief_strategy": {
-                "status": "completed",
-                "report": strategy
-            }
-        },
-
+        "agents": completed,
         "source_results": web_results,
         "official_site_evidence": official_site_evidence
     }
@@ -867,7 +923,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "7.0.0",
+        "version": "7.1.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
