@@ -25,7 +25,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered autonomous affiliate research platform",
-    version="7.1.0"
+    version="7.2.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -411,77 +411,120 @@ def collect_official_site_evidence(search_results):
 # ==========================================
 
 def run_discovery_agent(request, web_results):
-
     research_data = json.dumps(
         web_results,
         ensure_ascii=False,
         indent=2
     )
 
-    prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence.
+    broad_scope = request.niche.strip().lower() in {
+        DEFAULT_NICHE.lower(),
+        "all categories",
+        "all affiliate categories",
+        "discover all categories",
+        "general affiliate opportunities"
+    }
 
-Your mission is to independently discover promising
-affiliate business opportunities.
+    if broad_scope:
+        category_strategy = """
+BROAD DISCOVERY MODE:
+- Compare opportunities across multiple unrelated categories.
+- Aim for a balanced shortlist of up to the requested maximum.
+- Include SaaS/software, physical consumer products, digital products,
+  education/courses, technology, and services where supported by the evidence.
+- Do not allow one category to dominate the shortlist without a clear
+  evidence-based reason.
+- Try to include at least 5 distinct categories when the search evidence
+  supports them. Do not invent candidates just to fill a quota.
+"""
+    else:
+        category_strategy = """
+FOCUSED DISCOVERY MODE:
+- Respect the requested niche and prioritize relevant opportunities.
+- You may include adjacent categories only when they are genuinely relevant.
+- Do not force unrelated categories into the shortlist.
+"""
+
+    prompt = f"""
+You are the Market Discovery Agent of Affiliate Intelligence, version 7.2.
+
+MISSION:
+Discover, screen, compare and rank promising affiliate business
+opportunities using the supplied public web search evidence.
 
 RESEARCH SCOPE:
 {request.niche}
 
-MAXIMUM OPPORTUNITIES:
+MAXIMUM OPPORTUNITIES TO RETURN:
 {request.number_of_programs}
 
-PUBLIC WEB SEARCH RESULTS:
+DISCOVERY MODE:
+{category_strategy}
+
+PUBLIC WEB SEARCH RESULTS (UNVERIFIED LEADS):
 {research_data}
 
-YOUR RESPONSIBILITIES:
+REQUIRED WORKFLOW:
+1. Extract distinct companies, brands, products and services from the results.
+2. Remove duplicates and irrelevant results.
+3. Classify each candidate by product category and business model.
+4. Assess whether the product solves a clear customer problem.
+5. Identify likely target audiences and potential content angles.
+6. Look for evidence that an affiliate, referral, partner or creator program
+   may exist. A product being popular does not prove it has an affiliate program.
+7. Assess recurring-revenue potential only where the business model supports it.
+8. Compare candidates using the same scoring criteria.
+9. Rank the strongest candidates and explain the trade-offs.
 
-1. Discover companies, products and services.
-2. Identify different product categories.
-3. Identify potential customer audiences.
-4. Evaluate product usefulness and demand signals.
-5. Identify possible affiliate monetization models.
-6. Identify recurring revenue possibilities.
-7. Evaluate content creation opportunities.
-8. Identify business risks.
-9. Give each opportunity a preliminary score from 1 to 10.
-10. Rank the strongest opportunities.
+SCORING (1-10, preliminary analytical estimate):
+- Product usefulness / problem solved: 20%
+- Evidence of demand or market interest: 20%
+- Affiliate-program evidence / monetization fit: 20%
+- Content and audience potential: 15%
+- Recurring-revenue potential: 10%
+- Competitive accessibility for a new publisher: 10%
+- Evidence quality: 5%
 
-Explore different industries. Do not focus only on AI
-or software.
+Do not present this score as measured market data or a guarantee of earnings.
+Explain briefly why each candidate received its score.
 
-Consider physical products, digital products,
-SaaS, education, technology, services and other markets.
-
-For every opportunity include:
-- Company
+FOR EACH CANDIDATE INCLUDE:
+- Rank
+- Company / brand
 - Product or service
 - Category
-- Website URL, if supplied
+- Official website URL (only if present in supplied results)
 - Target audience
-- Evidence from search results
-- Possible affiliate model
-- Recurring revenue potential
+- Customer problem solved
+- Search evidence (identify which supplied result supports the point)
+- Affiliate-program evidence status: Found in search lead / Not found / Unclear
+- Possible monetization model (label as potential unless verified)
+- Recurring-revenue potential: High / Medium / Low / Unknown, with reason
+- Content opportunities
 - Advantages
-- Disadvantages
-- Marketing opportunities
-- Risks
-- Preliminary opportunity score
-- Missing information
+- Disadvantages and risks
+- Preliminary score out of 10 and short rationale
+- Key facts still requiring verification
 
-IMPORTANT:
+FINAL OUTPUT:
+A. Executive summary.
+B. Ranked comparison table of the strongest distinct opportunities.
+C. Category breakdown (especially in broad discovery mode).
+D. Top 3 candidates recommended for the Verification Agent, with reasons.
+E. Research gaps and limitations.
 
-Search results are leads, not proof of an active
-affiliate program.
+STRICT EVIDENCE RULES:
+- Search results are leads, not proof of an active affiliate program.
+- Never invent commission rates, cookie durations, prices, customer counts,
+  conversion rates, program terms, approval requirements or earnings.
+- Never claim a program is active unless the supplied evidence explicitly
+  supports that status. The Verification Agent will check official sources.
+- Mark unavailable information as "Not verified".
+- Clearly separate observed evidence, analytical estimates and unknowns.
+- If the supplied evidence supports fewer candidates than requested, return
+  fewer and explain why. Quality and traceability matter more than quantity.
 
-Never invent commission rates, cookie durations,
-prices, customer numbers or program conditions.
-
-Mark missing information as "Not verified".
-
-Clearly separate evidence from estimates.
-
-Finish with the best opportunities for further analysis.
-Return a structured professional report.
+Return a structured, concise but sufficiently detailed professional report.
 """
 
     return generate_ai_response(prompt)
@@ -867,7 +910,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.1.0",
+            "version": "7.2.0",
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
             "niche": request.niche,
@@ -886,7 +929,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.1.0",
+            "version": "7.2.0",
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
             "niche": request.niche,
@@ -903,7 +946,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "7.1.0",
+        "version": "7.2.0",
         "workflow": "Five-Agent Affiliate Intelligence System",
         "model": MODEL_NAME,
         "niche": request.niche,
@@ -923,7 +966,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "7.1.0",
+        "version": "7.2.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
