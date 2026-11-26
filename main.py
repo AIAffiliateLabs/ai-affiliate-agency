@@ -25,7 +25,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="7.8.0"
+    version="7.9.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -619,31 +619,42 @@ def _candidate_page_match(candidate_name, page):
 
 
 def _extract_explicit_terms(text):
-    """Extract only obvious numeric terms from the inspected page text; never infer."""
+    """Extract a term only when a focused sentence explicitly connects value and term."""
     commission = "Not verified"
     cookie = "Not verified"
-
-    commission_patterns = [
-        r"(?:commission|commissions|referral fee|payout)[^.%$]{0,45}(\d{1,3}(?:\.\d{1,2})?\s*%)",
-        r"(\d{1,3}(?:\.\d{1,2})?\s*%)[^.\n]{0,45}(?:commission|referral|sale)"
-    ]
-    for pattern in commission_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            commission = match.group(1).strip()
+    evidence = []
+    normalized = re.sub(r"\s+", " ", text or "")
+    # Split into sentence-like units to avoid borrowing unrelated page numbers.
+    chunks = re.split(r"(?<=[.!?;])\s+|\n+", normalized)
+    for chunk in chunks:
+        sentence = chunk.strip()
+        if not sentence or len(sentence) > 500:
+            continue
+        if commission == "Not verified" and re.search(r"(?i)\b(commission|commissions|referral fee|payout per sale|earn per sale)\b", sentence):
+            m = re.search(r"(?i)(\d{1,3}(?:\.\d{1,2})?\s*%)", sentence)
+            if m and not re.search(r"(?i)\b(discount|off|save|sale price|tax|vat)\b", sentence):
+                commission = re.sub(r"\s+", "", m.group(1))
+                evidence.append({"term": "commission", "value": commission, "excerpt": sentence[:350]})
+        if cookie == "Not verified" and re.search(r"(?i)\bcookie\b", sentence):
+            m = re.search(r"(?i)(\d{1,4}\s*(?:days?|weeks?|months?))", sentence)
+            if m:
+                cookie = re.sub(r"\s+", " ", m.group(1)).strip()
+                evidence.append({"term": "cookie_duration", "value": cookie, "excerpt": sentence[:350]})
+        if commission != "Not verified" and cookie != "Not verified":
             break
+    return commission, cookie, evidence
 
-    cookie_patterns = [
-        r"cookie(?:\s+duration|\s+window)?\s*(?:is|of|:)?\s*(\d{1,4}\s*(?:days?|weeks?|months?))",
-        r"(\d{1,4}\s*(?:days?|weeks?|months?))[^.\n]{0,35}cookie"
-    ]
-    for pattern in cookie_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            cookie = re.sub(r"\s+", " ", match.group(1)).strip()
-            break
 
-    return commission, cookie
+def _classify_program_type(pages):
+    """Conservative classification; partner language alone is not an affiliate program."""
+    text = " ".join(_page_text(page) for page in pages).lower()
+    if any(x in text for x in ("affiliate program", "affiliate programme", "become an affiliate", "publisher program", "referral commission")):
+        return "Classic affiliate/referral program — evidence language observed"
+    if any(x in text for x in ("agency partner", "technology partner", "solution partner", "reseller partner", "integration partner", "partner directory")):
+        return "B2B/agency/technology partnership — not confirmed as a publisher affiliate program"
+    if any(x in text for x in ("partner program", "partner programme", "partners")):
+        return "Partner program — type unclear; classic affiliate status not established"
+    return "Unclear / no program type established"
 
 
 def build_structured_evidence_records(
@@ -675,14 +686,16 @@ def build_structured_evidence_records(
         # Contextual market sources are retained separately and are never
         # upgraded to candidate-specific proof merely because they mention a brand.
         related_market_sources = []
+        candidate_tokens = [t for t in re.findall(r"[a-z0-9]+", name.lower()) if len(t) >= 4]
         for source in market_sources:
             title_desc = f"{source.get('title', '')} {source.get('description', '')}".lower()
-            if candidate_key and candidate_key in _candidate_key(title_desc):
+            # Match a recognizable candidate token in title/snippet, not generic category words.
+            if candidate_tokens and any(re.search(r"\b" + re.escape(token) + r"\b", title_desc) for token in candidate_tokens):
                 related_market_sources.append({
                     "title": source.get("title", ""),
                     "url": source.get("url", ""),
                     "search_query": source.get("search_query", ""),
-                    "evidence_type": "Contextual market discovery lead — not program verification"
+                    "evidence_type": "Candidate-mentioned market discovery lead — not program verification"
                 })
         matched_pages = [
             page for page in pages
@@ -702,16 +715,24 @@ def build_structured_evidence_records(
             for page in candidate_pages
         }
         program_pages = []
+        affiliate_pages = []
         for page in candidate_pages:
             text_content = _page_text(page)
             url_text = (page.get("final_url") or page.get("requested_url", "")).lower()
             has_program_language = any(term in text_content or term in url_text for term in (
                 "affiliate program", "affiliate-partner", "affiliate partner",
                 "partner program", "referral program", "creator program",
-                "become an affiliate", "join our affiliate"
+                "become an affiliate", "join our affiliate", "publisher program"
             ))
             if has_program_language:
                 program_pages.append(page)
+            has_affiliate_language = any(term in text_content or term in url_text for term in (
+                "affiliate program", "affiliate programme", "affiliate-partner",
+                "affiliate partner", "referral program", "creator program",
+                "become an affiliate", "join our affiliate", "publisher program"
+            ))
+            if has_affiliate_language:
+                affiliate_pages.append(page)
 
         # A closure status is assigned only when an inspected, candidate-matched
         # page contains explicit discontinuation language tied to an affiliate/
@@ -737,9 +758,12 @@ def build_structured_evidence_records(
         if discontinued_evidence:
             status = "Program discontinued — do not promote"
             confidence = "Medium — explicit closure language on candidate-matched page; domain ownership still not independently authenticated"
-        elif program_pages:
+        elif affiliate_pages:
             status = "Candidate-matched affiliate/partner page inspected — program evidence found"
             confidence = "Medium — candidate/domain text match; ownership not independently authenticated"
+        elif program_pages:
+            status = "Candidate-matched partnership page inspected — affiliate program not established"
+            confidence = "Low to Medium — candidate/domain text match; partnership type requires confirmation"
         elif candidate_pages:
             status = "Candidate-matched website inspected — program not found in inspected pages"
             confidence = "Low to Medium — candidate/domain text match only"
@@ -762,10 +786,12 @@ def build_structured_evidence_records(
         if status == "Program discontinued — do not promote":
             application_status = "Closed — explicit discontinuation evidence"
         elif any(any(phrase in _page_text(page) for phrase in application_phrases)
-                 for page in program_pages):
+                 for page in affiliate_pages):
             application_status = "Application link/invitation observed; acceptance not confirmed"
-        elif program_pages:
+        elif affiliate_pages:
             application_status = "Program described; application status unclear"
+        elif program_pages:
+            application_status = "Partnership page observed; affiliate application status not applicable/unclear"
 
         evidence_urls = []
         for page in (discontinued_evidence or program_pages or candidate_pages):
@@ -781,25 +807,25 @@ def build_structured_evidence_records(
         commission = "Not verified"
         cookie_duration = "Not verified"
         term_evidence = []
-        for page in program_pages:
+        # Only inspect affiliate-specific pages for publisher commission/cookie terms.
+        for page in affiliate_pages:
             text_content = _page_text(page)
-            page_commission, page_cookie = _extract_explicit_terms(text_content)
-            if page_commission != "Not verified":
-                commission = page_commission
-                term_evidence.append({
-                    "term": "commission",
-                    "value": page_commission,
-                    "evidence_url": page.get("final_url") or page.get("requested_url"),
-                    "excerpt": text_content[:700]
-                })
-            if page_cookie != "Not verified":
-                cookie_duration = page_cookie
-                term_evidence.append({
-                    "term": "cookie_duration",
-                    "value": page_cookie,
-                    "evidence_url": page.get("final_url") or page.get("requested_url"),
-                    "excerpt": text_content[:700]
-                })
+            page_commission, page_cookie, page_term_evidence = _extract_explicit_terms(text_content)
+            for item in page_term_evidence:
+                item["evidence_url"] = page.get("final_url") or page.get("requested_url")
+                term_evidence.append(item)
+            if commission == "Not verified" and page_commission != "Not verified":
+                supported = any(e.get("term") == "commission" and e.get("value") == page_commission
+                                and re.search(r"(?i)\b(commission|referral fee|payout per sale|earn per sale)\b", e.get("excerpt", ""))
+                                and re.search(r"\d+(?:\.\d+)?\s*%", e.get("excerpt", "")) for e in page_term_evidence)
+                if supported:
+                    commission = page_commission
+            if cookie_duration == "Not verified" and page_cookie != "Not verified":
+                supported = any(e.get("term") == "cookie_duration" and e.get("value") == page_cookie
+                                and re.search(r"(?i)\bcookie\b", e.get("excerpt", ""))
+                                and re.search(r"\d+\s*(days?|weeks?|months?)", e.get("excerpt", "")) for e in page_term_evidence)
+                if supported:
+                    cookie_duration = page_cookie
 
         records.append({
             "candidate": name,
@@ -839,6 +865,7 @@ def build_structured_evidence_records(
             "verification_status": status,
             "program_status": status,
             "application_status": application_status,
+            "program_type": _classify_program_type(program_pages or candidate_pages),
             "commission": commission,
             "cookie_duration": cookie_duration,
             "eligibility": "Not verified",
@@ -881,6 +908,27 @@ def build_agent_consistency_audit(records, agent_reports):
                 "issue": "No discovery source URL retained; manual source recovery recommended",
                 "severity": "source_gap"
             })
+        # Numeric terms are invalid unless a focused matching excerpt supports them.
+        for term_name, field_name in (("commission", "commission"), ("cookie_duration", "cookie_duration")):
+            value = record.get(field_name, "Not verified")
+            if value and value != "Not verified":
+                matching = [e for e in (record.get("term_evidence") or [])
+                            if e.get("term") == term_name and str(e.get("value", "")).replace(" ", "") == str(value).replace(" ", "")]
+                excerpt_ok = False
+                for evidence in matching:
+                    excerpt = evidence.get("excerpt", "")
+                    if term_name == "commission":
+                        excerpt_ok = bool(re.search(r"(?i)\b(commission|referral fee|payout per sale|earn per sale)\b", excerpt) and re.search(r"\d+(?:\.\d+)?\s*%", excerpt))
+                    else:
+                        excerpt_ok = bool(re.search(r"(?i)\bcookie\b", excerpt) and re.search(r"\d+\s*(days?|weeks?|months?)", excerpt))
+                    if excerpt_ok and evidence.get("evidence_url"):
+                        break
+                if not excerpt_ok:
+                    findings.append({
+                        "candidate": name, "agent": "evidence_ledger", "ledger_status": status,
+                        "issue": f"{field_name} value lacks a matching focused excerpt and source URL; reset to Not verified",
+                        "severity": "unsupported_term", "reported_value": value
+                    })
 
         if status == "Program discontinued — do not promote":
             restricted_claims = re.compile(
@@ -979,7 +1027,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 7.8.
+You are the Market Discovery Agent of Affiliate Intelligence, version 7.9.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1104,7 +1152,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 7.8.
+You are the Verification Agent of Affiliate Intelligence, version 7.9.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1324,8 +1372,14 @@ DATA INTEGRITY CONTRACT:
 - Use the ledger's exact verification_status and application_status for every candidate.
 - If program status is discontinued, financial attractiveness must be N/A and the
   candidate must be excluded from viable affiliate recommendations.
-- If commission and cookie terms are Not verified, do not calculate earnings, CLV,
+- If commission OR cookie terms are Not verified, do not calculate earnings, CLV,
   recurring revenue, or numeric payout scenarios for that candidate.
+- A numeric term is usable only when its ledger term_evidence has a focused excerpt
+  containing both the relevant keyword and the exact value, plus an evidence URL.
+- Never treat a missing commission as 0%; missing means Not verified, not zero.
+- Do not assign a numeric financial score to a candidate without a verified program
+  and verified commission basis. Use Not scored — insufficient verified evidence.
+- B2B/agency/technology partnership is not automatically a publisher affiliate program.
 - If program status is unverified or third-party-only, do not assign a numeric
   financial attractiveness score; use "Not scored — insufficient verified evidence".
 
@@ -1337,6 +1391,9 @@ DISCOVERY REPORT:
 
 VERIFICATION REPORT:
 {verification_report}
+
+STRUCTURED EVIDENCE LEDGER (AUTHORITATIVE TERM RECORDS):
+{structured_data}
 
 Analyze:
 
@@ -1425,6 +1482,10 @@ FINAL DATA INTEGRITY CONTRACT:
   current program terms have been independently authenticated; the current ledger
   does not independently authenticate domain ownership.
 - Exclude unverified and third-party-only candidates from the verified shortlist.
+- A B2B/agency/technology partnership is not a classic publisher affiliate program;
+  classify it separately and do not recommend it as an affiliate offer without evidence.
+- Never rank by commission or cookie values unless focused term_evidence supports them.
+- Unknown commission is not zero and must never be converted to a zero-percent rate.
 - Do not silently reconcile conflicts between reports; list them as unresolved.
 
 You are responsible for making the final strategic decision.
@@ -1613,7 +1674,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.8.0",
+            "version": "7.9.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1642,7 +1703,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.8.0",
+            "version": "7.9.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1679,7 +1740,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "7.8.0",
+        "version": "7.9.0",
         "agent_consistency_audit": agent_consistency_audit,
         "report_generated_at_utc": report_generated_at_utc,
         "workflow": "Five-Agent Affiliate Intelligence System",
@@ -1705,7 +1766,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "7.8.0",
+        "version": "7.9.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
