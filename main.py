@@ -24,8 +24,8 @@ from ddgs import DDGS
 
 app = FastAPI(
     title="Affiliate Intelligence",
-    description="AI-powered affiliate research and verification platform",
-    version="7.3.0"
+    description="AI-powered affiliate research, merchant discovery and verification platform",
+    version="7.4.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -224,6 +224,20 @@ def extract_discovery_candidates(discovery_report: str, limit: int = 10):
     """Extract company names from the ranked Markdown comparison table."""
     candidates = []
     seen = set()
+    directory_names = {
+        "the affiliates list", "saas affiliate", "affiliates list",
+        "digistore24", "impact.com", "impact", "partnerstack",
+        "awin", "shareasale", "cj affiliate", "commission junction",
+        "clickbank", "rakuten advertising", "amazon associates",
+        "class central", "lasso", "hostadvice"
+    }
+    generic_names = {
+        "affiliate network", "affiliate directory", "affiliate marketplace",
+        "affiliate program directory", "software affiliate programs",
+        "physical products", "digital products", "online courses",
+        "consumer technology", "technology products", "various brands",
+        "affiliate programs", "affiliate platform"
+    }
 
     for raw_line in discovery_report.splitlines():
         line = raw_line.strip()
@@ -253,7 +267,13 @@ def extract_discovery_candidates(discovery_report: str, limit: int = 10):
             name_parts = [name]
 
         for candidate_name in name_parts:
-            if not candidate_name or candidate_name.lower() in generic:
+            normalized_name = candidate_name.lower().strip()
+            if (
+                not candidate_name
+                or normalized_name in generic
+                or normalized_name in generic_names
+                or normalized_name in directory_names
+            ):
                 continue
             if candidate_name.lower() in seen:
                 continue
@@ -514,13 +534,66 @@ def collect_official_site_evidence(search_results):
     }
 
 
+def collect_market_page_evidence(search_results, max_pages: int = 14):
+    """
+    Inspect public search-result pages to extract underlying brands/products
+    from directories, comparison articles and marketplace listings.
+    These pages are discovery leads only, never proof of affiliate terms.
+    """
+    inspected = []
+    seen = set()
+
+    for item in search_results:
+        url = item.get("url")
+        if not url or url in seen:
+            continue
+
+        seen.add(url)
+        page = inspect_public_page(url)
+
+        compact_links = []
+        for link in page.get("links", [])[:100]:
+            href, label = link
+            absolute = urljoin(page.get("final_url") or url, href)
+            compact_links.append({
+                "url": absolute,
+                "label": label or ""
+            })
+
+        inspected.append({
+            "search_title": item.get("title", ""),
+            "search_url": url,
+            "search_description": item.get("description", ""),
+            "page_status": page.get("status", "unknown"),
+            "page_title": page.get("title", ""),
+            "page_description": page.get("description", ""),
+            "page_text_excerpt": page.get("text_excerpt", "")[:4500],
+            "outbound_and_internal_links": compact_links[:60],
+            "fetch_reason": page.get("reason", "")
+        })
+
+        if len(inspected) >= max_pages:
+            break
+
+    return {
+        "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+        "pages_attempted": len(inspected),
+        "pages": inspected
+    }
+
+
 # ==========================================
 # AGENT 1 — MARKET DISCOVERY
 # ==========================================
 
-def run_discovery_agent(request, web_results):
+def run_discovery_agent(request, web_results, market_page_evidence=None):
     research_data = json.dumps(
         web_results,
+        ensure_ascii=False,
+        indent=2
+    )
+    page_evidence_data = json.dumps(
+        market_page_evidence or {"pages": []},
         ensure_ascii=False,
         indent=2
     )
@@ -537,13 +610,17 @@ def run_discovery_agent(request, web_results):
         category_strategy = """
 BROAD DISCOVERY MODE:
 - Compare opportunities across multiple unrelated categories.
-- Aim for a balanced shortlist of up to the requested maximum.
-- Include SaaS/software, physical consumer products, digital products,
-  education/courses, technology, and services where supported by the evidence.
-- Do not allow one category to dominate the shortlist without a clear
-  evidence-based reason.
-- Try to include at least 5 distinct categories when the search evidence
-  supports them. Do not invent candidates just to fill a quota.
+- Aim for up to the requested maximum of DISTINCT MERCHANT BRANDS or
+  specific products/services that a publisher could realistically promote.
+- Search-page evidence includes directory and comparison pages. Treat those
+  pages as sources to mine for the actual brands listed inside them.
+- Do not count affiliate directories, affiliate networks, review blogs,
+  comparison websites or affiliate software platforms as merchant opportunities.
+- Seek a balanced mix across SaaS/software, physical consumer products,
+  digital products, education/courses, technology and services when evidence
+  supports them.
+- Aim for at least 5 distinct categories and 10 concrete merchant candidates
+  when supported by the supplied evidence. Never invent candidates to hit a quota.
 """
     else:
         category_strategy = """
@@ -554,7 +631,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 7.3.
+You are the Market Discovery Agent of Affiliate Intelligence, version 7.4.
 
 MISSION:
 Discover, screen, compare and rank promising affiliate business
@@ -572,17 +649,28 @@ DISCOVERY MODE:
 PUBLIC WEB SEARCH RESULTS (UNVERIFIED LEADS):
 {research_data}
 
+INSPECTED PUBLIC PAGE CONTENT AND LISTING LINKS (UNVERIFIED DISCOVERY EVIDENCE):
+{page_evidence_data}
+
 REQUIRED WORKFLOW:
-1. Extract distinct companies, brands, products and services from the results.
-2. Remove duplicates and irrelevant results.
-3. Classify each candidate by product category and business model.
-4. Assess whether the product solves a clear customer problem.
-5. Identify likely target audiences and potential content angles.
-6. Look for evidence that an affiliate, referral, partner or creator program
+1. Mine the inspected page text and links for the actual merchant brands,
+   products and services named inside directories, roundups, comparison pages
+   and category listings. Do not return the directory itself as a candidate.
+2. For every extracted brand, retain the exact source page URL and, when
+   available, its own official-domain URL. If the official domain is uncertain,
+   mark it "Not identified" rather than guessing.
+3. Extract distinct companies, brands, products and services from the search
+   results and inspected page content.
+4. Remove duplicates, directory brands, affiliate networks, publisher blogs,
+   software used to manage affiliate programs, and irrelevant results.
+5. Classify each candidate by product category and business model.
+6. Assess whether the product solves a clear customer problem.
+7. Identify likely target audiences and potential content angles.
+8. Look for evidence that an affiliate, referral, partner or creator program
    may exist. A product being popular does not prove it has an affiliate program.
-7. Assess recurring-revenue potential only where the business model supports it.
-8. Compare candidates using the same scoring criteria.
-9. Rank the strongest candidates and explain the trade-offs.
+9. Assess recurring-revenue potential only where the business model supports it.
+10. Compare candidates using the same scoring criteria.
+11. Rank the strongest candidates and explain the trade-offs.
 
 SCORING (1-10, preliminary analytical estimate):
 - Product usefulness / problem solved: 20%
@@ -598,10 +686,11 @@ Explain briefly why each candidate received its score.
 
 FOR EACH CANDIDATE INCLUDE:
 - Rank
-- Company / brand
+- Company / brand (must be a concrete merchant, not a directory/network)
 - Product or service
 - Category
-- Official website URL (only if present in supplied results)
+- Official website URL (only if present in supplied evidence; never guess)
+- Discovery source URL (exact supplied search/page URL)
 - Target audience
 - Customer problem solved
 - Search evidence (identify which supplied result supports the point)
@@ -616,10 +705,15 @@ FOR EACH CANDIDATE INCLUDE:
 
 FINAL OUTPUT:
 A. Executive summary.
-B. Ranked comparison table of the strongest distinct opportunities.
+B. Ranked comparison table of the strongest distinct merchant opportunities.
+   Use one row per merchant. Include exact Discovery source URL and official
+   website URL only when supplied evidence contains them.
 C. Category breakdown (especially in broad discovery mode).
-D. Top 3 candidates recommended for the Verification Agent, with reasons.
-E. Research gaps and limitations.
+D. Directory extraction log: name each directory/listing page used and list
+   the merchant brands extracted from it. Do not count the directory itself.
+E. Top 3-10 concrete merchant candidates recommended for the Verification
+   Agent, with reasons. Prefer up to 10 when evidence supports them.
+F. Research gaps and limitations.
 
 STRICT EVIDENCE RULES:
 - Search results are leads, not proof of an active affiliate program.
@@ -629,8 +723,17 @@ STRICT EVIDENCE RULES:
   supports that status. The Verification Agent will check official sources.
 - Mark unavailable information as "Not verified".
 - Clearly separate observed evidence, analytical estimates and unknowns.
+- Never use a directory, affiliate network, comparison blog or affiliate
+  management platform as a merchant candidate merely because it appears in
+  search results.
+- If a directory lists individual merchants, extract those merchant names and
+  cite the directory URL as discovery evidence. Their affiliate terms remain
+  unverified until the Verification Agent checks official sources.
 - If the supplied evidence supports fewer candidates than requested, return
   fewer and explain why. Quality and traceability matter more than quantity.
+- The comparison table MUST use this exact first column format:
+  | Rank | Company / Brand | Category | Product / Service | Official Website URL | Discovery Source URL | ...
+  This allows the next agent to extract candidates reliably.
 
 Return a structured, concise but sufficiently detailed professional report.
 """
@@ -648,7 +751,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     inspected_data = json.dumps(official_site_evidence, ensure_ascii=False, indent=2)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 7.3.
+You are the Verification Agent of Affiliate Intelligence, version 7.4.
 
 MISSION:
 Audit each company/product candidate from Market Discovery. Your job is to
@@ -984,9 +1087,14 @@ def run_agent_workflow(request: ResearchRequest):
 
     completed = {}
     current_agent = "Market Discovery Agent"
+    market_page_evidence = collect_market_page_evidence(web_results)
 
     try:
-        discovery = run_discovery_agent(request, web_results)
+        discovery = run_discovery_agent(
+            request,
+            web_results,
+            market_page_evidence
+        )
         completed["market_discovery"] = {
             "status": "completed",
             "report": discovery
@@ -1040,7 +1148,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.3.0",
+            "version": "7.4.0",
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
             "niche": request.niche,
@@ -1051,6 +1159,7 @@ def run_agent_workflow(request: ResearchRequest):
                 "detail": error.detail
             },
             "completed_agents": completed,
+            "market_page_evidence": market_page_evidence,
             "discovered_candidates": discovered_candidates if "discovered_candidates" in locals() else [],
             "candidate_searches": candidate_searches if "candidate_searches" in locals() else [],
             "official_site_evidence": official_site_evidence if "official_site_evidence" in locals() else {},
@@ -1062,7 +1171,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.3.0",
+            "version": "7.4.0",
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
             "niche": request.niche,
@@ -1073,6 +1182,7 @@ def run_agent_workflow(request: ResearchRequest):
                 "detail": "Unexpected agent error. Check Railway logs."
             },
             "completed_agents": completed,
+            "market_page_evidence": market_page_evidence,
             "discovered_candidates": discovered_candidates if "discovered_candidates" in locals() else [],
             "candidate_searches": candidate_searches if "candidate_searches" in locals() else [],
             "official_site_evidence": official_site_evidence if "official_site_evidence" in locals() else {},
@@ -1082,12 +1192,13 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "7.3.0",
+        "version": "7.4.0",
         "workflow": "Five-Agent Affiliate Intelligence System",
         "model": MODEL_NAME,
         "niche": request.niche,
         "search_results_found": len(web_results),
         "agents": completed,
+        "market_page_evidence": market_page_evidence,
         "source_results": web_results,
         "discovered_candidates": discovered_candidates,
         "candidate_searches": candidate_searches,
@@ -1104,7 +1215,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "7.3.0",
+        "version": "7.4.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
@@ -1164,9 +1275,11 @@ def research(request: ResearchRequest):
             detail="Web search returned no results."
         )
 
+    market_page_evidence = collect_market_page_evidence(web_results)
     report = run_discovery_agent(
         request,
-        web_results
+        web_results,
+        market_page_evidence
     )
 
     return {
@@ -1175,6 +1288,7 @@ def research(request: ResearchRequest):
         "model": MODEL_NAME,
         "search_results_found": len(web_results),
         "research_report": report,
+        "market_page_evidence": market_page_evidence,
         "source_results": web_results
     }
 
