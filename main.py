@@ -12,8 +12,7 @@ app = FastAPI(
     version="4.0.0"
 )
 
-MODEL_NAME = "gemini-3.8-flash"
-
+MODEL_NAME = "gemini-2.5-flash"
 
 class ResearchRequest(BaseModel):
     niche: str = "AI tools and SaaS software"
