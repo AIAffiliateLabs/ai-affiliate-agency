@@ -24,8 +24,8 @@ from ddgs import DDGS
 
 app = FastAPI(
     title="Affiliate Intelligence",
-    description="AI-powered autonomous affiliate research platform",
-    version="7.2.0"
+    description="AI-powered affiliate research and verification platform",
+    version="7.3.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -217,6 +217,111 @@ def collect_market_research(niche: str):
 
 
 # ==========================================
+# CANDIDATE-SPECIFIC VERIFICATION RESEARCH
+# ==========================================
+
+def extract_discovery_candidates(discovery_report: str, limit: int = 10):
+    """Extract company names from the ranked Markdown comparison table."""
+    candidates = []
+    seen = set()
+
+    for raw_line in discovery_report.splitlines():
+        line = raw_line.strip()
+        if not line.startswith('|'):
+            continue
+        cells = [cell.strip() for cell in line.strip('|').split('|')]
+        if len(cells) < 3:
+            continue
+        rank_text = re.sub(r'[*` ]', '', cells[0])
+        if not rank_text.isdigit():
+            continue
+
+        name = re.sub(r'[*_`]', '', cells[1]).strip()
+        name = re.sub(r'\s+', ' ', name)
+        name = re.sub(r'\s*\([^)]*\)\s*$', '', name).strip()
+
+        # Split paired company names, but discard generic descriptors after '/'.
+        generic = {
+            'high-ticket consumer technology & electronics',
+            'high-ticket electronics', 'tech', 'ai tools', 'various tech brands',
+            'consumer technology & electronics', 'electronics'
+        }
+        name_parts = [part.strip() for part in name.split('/') if part.strip()]
+        if len(name_parts) > 1:
+            name_parts = [part for part in name_parts if part.lower() not in generic]
+        else:
+            name_parts = [name]
+
+        for candidate_name in name_parts:
+            if not candidate_name or candidate_name.lower() in generic:
+                continue
+            if candidate_name.lower() in seen:
+                continue
+            seen.add(candidate_name.lower())
+            candidates.append({
+                'rank': int(rank_text),
+                'candidate': candidate_name,
+                'category': cells[2] if len(cells) > 2 else 'Not stated'
+            })
+            if len(candidates) >= limit:
+                break
+        if len(candidates) >= limit:
+            break
+
+    return candidates
+
+
+def collect_candidate_specific_evidence(discovery_report: str, general_search_results):
+    """Search each discovered company by name; keep leads tied to that candidate."""
+    candidates = extract_discovery_candidates(discovery_report)
+    candidate_searches = []
+    candidate_results = []
+    seen_urls = set()
+
+    for candidate in candidates:
+        name = candidate['candidate']
+        query = f'"{name}" official website affiliate partner program'
+        results = search_web(query, max_results=3)
+        cleaned = []
+
+        for item in results:
+            url = item.get('href') or item.get('url')
+            if not url:
+                continue
+            record = {
+                'candidate': name,
+                'search_query': query,
+                'title': item.get('title', ''),
+                'url': url,
+                'description': item.get('body', '')
+            }
+            cleaned.append(record)
+            candidate_results.append(record)
+            seen_urls.add(url)
+
+        candidate_searches.append({
+            'candidate': name,
+            'rank': candidate['rank'],
+            'category': candidate['category'],
+            'query': query,
+            'results_found': len(cleaned),
+            'results': cleaned
+        })
+
+    # Retain a small general evidence set as context, but prioritize targeted results.
+    for item in general_search_results[:5]:
+        url = item.get('url')
+        if url and url not in seen_urls:
+            candidate_results.append({
+                'candidate': 'General market context — not attributable to a specific company',
+                **item
+            })
+            seen_urls.add(url)
+
+    return candidates, candidate_searches, candidate_results
+
+
+# ==========================================
 # SAFE OFFICIAL-WEBSITE INSPECTION
 # ==========================================
 
@@ -353,25 +458,24 @@ def inspect_public_page(url: str):
 
 
 def collect_official_site_evidence(search_results):
-    """
-    Inspect a bounded set of search-result pages and affiliate-related links.
-    A fetched page is evidence, not automatic proof that a domain is official.
-    """
+    """Inspect candidate-specific search pages first, then a small general fallback."""
     inspected = []
     seen = set()
     candidates = []
 
+    # Candidate-specific results are passed first by the workflow.
     for item in search_results:
         url = item.get("url")
         if not url or url in seen:
             continue
         seen.add(url)
-        candidates.append(url)
-        if len(candidates) >= MAX_INITIAL_PAGES:
+        candidates.append({"url": url, "candidate": item.get("candidate", "Unassigned")})
+        if len(candidates) >= 24:
             break
 
-    for url in candidates:
-        page = inspect_public_page(url)
+    for item in candidates:
+        page = inspect_public_page(item["url"])
+        page["candidate"] = item["candidate"]
         inspected.append(page)
 
     affiliate_candidates = []
@@ -386,13 +490,17 @@ def collect_official_site_evidence(search_results):
                 candidate = urljoin(base, href)
                 if urlparse(candidate).hostname == base_host and candidate not in seen:
                     seen.add(candidate)
-                    affiliate_candidates.append(candidate)
+                    affiliate_candidates.append({
+                        "url": candidate,
+                        "candidate": page.get("candidate", "Unassigned")
+                    })
 
-    # Keep the follow-up inspection small and same-domain.
-    for url in affiliate_candidates[:MAX_AFFILIATE_LINKS_PER_DOMAIN * 5]:
-        inspected.append(inspect_public_page(url))
+    # Inspect a bounded number of affiliate/partner links on the same host.
+    for item in affiliate_candidates[:15]:
+        page = inspect_public_page(item["url"])
+        page["candidate"] = item["candidate"]
+        inspected.append(page)
 
-    # Remove raw link lists from the evidence sent to Gemini to keep prompts compact.
     compact = []
     for page in inspected:
         item = dict(page)
@@ -446,7 +554,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 7.2.
+You are the Market Discovery Agent of Affiliate Intelligence, version 7.3.
 
 MISSION:
 Discover, screen, compare and rank promising affiliate business
@@ -534,70 +642,87 @@ Return a structured, concise but sufficiently detailed professional report.
 # AGENT 2 — VERIFICATION
 # ==========================================
 
-def run_verification_agent(discovery_report, web_results, official_site_evidence):
-
-    research_data = json.dumps(web_results, ensure_ascii=False, indent=2)
+def run_verification_agent(discovery_report, candidate_searches, official_site_evidence):
+    """Verify each candidate against its own targeted search and inspected pages."""
+    research_data = json.dumps(candidate_searches, ensure_ascii=False, indent=2)
     inspected_data = json.dumps(official_site_evidence, ensure_ascii=False, indent=2)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 7.
+You are the Verification Agent of Affiliate Intelligence, version 7.3.
 
-Your job is to assess each opportunity using BOTH search evidence and
-the public website pages that the system actually fetched.
+MISSION:
+Audit each company/product candidate from Market Discovery. Your job is to
+verify whether that specific company has an affiliate, referral, partner,
+creator or publisher program, using candidate-specific evidence.
 
 DISCOVERY REPORT:
 {discovery_report}
 
-SEARCH EVIDENCE:
+CANDIDATE-SPECIFIC SEARCH RESULTS:
 {research_data}
 
-DIRECTLY INSPECTED PUBLIC PAGE EVIDENCE:
+PUBLIC PAGES ACTUALLY FETCHED BY THIS SYSTEM:
 {inspected_data}
 
-For every opportunity, report:
-1. Company and product/service.
-2. Candidate official domain and why it appears to belong to the company.
-3. Whether an affiliate/partner/referral page was directly inspected.
-4. Evidence of program availability or application status.
-5. Commission rate/model, only if explicitly shown.
-6. Cookie duration, only if explicitly shown.
-7. Important eligibility, geography, payout or program terms, only if shown.
-8. Source URLs and short exact evidence excerpts.
-9. What remains unknown or contradictory.
+IMPORTANT MATCHING RULE:
+- Keep evidence attached to the exact candidate named in each search result/page.
+- Do not use a different company's page as proof for this candidate.
+- A marketplace/network directory or blog article is third-party evidence,
+  not the candidate's official affiliate program page.
+- A page is not official merely because it mentions the company. Assess the
+  domain and page ownership from the evidence; if uncertain, say so.
+- If the candidate is an affiliate software/network platform (for example,
+  software used by merchants to run affiliate programs), distinguish it from
+  a brand/product that publishers can themselves promote. Do not assume it
+  has a publisher-facing affiliate program.
 
-Use exactly one of these verification statuses:
+FOR EACH DISCOVERED CANDIDATE, REPORT:
+1. Candidate company/product and category.
+2. Candidate's likely official domain, only when supported by evidence.
+3. Official-domain confidence: High / Medium / Low / Unknown, with reason.
+4. Official affiliate/partner page URL, only if it appears in inspected evidence.
+5. Whether that page was directly inspected by this system.
+6. Program status: explicitly accepting applications / program described but
+   application status unclear / not found in inspected pages / unknown.
+7. Commission amount/model, only if explicitly stated on a reliable source.
+8. Cookie duration, only if explicitly stated.
+9. Eligibility, geography, payout threshold and restrictions, only if stated.
+10. Short evidence excerpts and their exact source URLs.
+11. Unknowns, contradictions and recommended next verification step.
+
+USE EXACTLY ONE VERIFICATION STATUS PER CANDIDATE:
 - Official affiliate page inspected — program evidence found
 - Official website inspected — affiliate program not found in inspected pages
 - Third-party evidence only
 - Not verified
 - Conflicting evidence
 
-CRITICAL EVIDENCE RULES:
-- A fetched page is not automatically an official page. Assess the domain carefully.
-- A search snippet is not direct website verification.
-- Do not say a program is active or accepting applications unless the inspected
-  page explicitly supports that conclusion.
-- Do not infer commissions, cookie durations, payouts or terms.
+EVIDENCE RULES:
+- Search snippets and third-party roundups are leads, not direct verification.
+- A fetched page is not automatically official; explain why you consider it
+  official or why ownership remains uncertain.
+- Do not claim a program is active or accepting applications unless the
+  inspected official page explicitly supports that conclusion.
+- Do not infer commissions, cookie durations, payouts, eligibility or terms.
 - If a value is absent, write "Not stated on inspected pages".
-- If a page could not be fetched, say so.
-- "Not found in inspected pages" does NOT mean the program does not exist.
-- Do not invent URLs, quotes, dates or facts.
-- Keep facts, interpretation and unknowns clearly separated.
+- If fetching failed, say "Page could not be inspected" and include the reason
+  when available.
+- "Not found in inspected pages" does not mean the program does not exist.
+- Never invent URLs, quotes, dates, program status or facts.
+- Clearly separate directly observed facts, third-party claims and analysis.
 
-For each opportunity include:
-- Company / product
-- Candidate official website
-- Affiliate page URL (if actually present in inspected evidence)
-- Direct inspection result
-- Program/application status
-- Commission
-- Cookie duration
-- Terms and eligibility
-- Evidence excerpts with source URLs
-- Verification status
-- Missing information / next checks
+OUTPUT:
+A. Executive summary of verification coverage.
+B. One verification profile for EVERY candidate in the discovery shortlist.
+C. Comparison table with candidate, official domain confidence, status,
+   direct affiliate page inspected (Yes/No), commission (if verified),
+   cookie (if verified), and key unknowns.
+D. Evidence-ranked shortlist. Rank by strength of evidence, not estimated
+   earnings or the Market Discovery score.
+E. Research gaps and next checks.
 
-Finish with a ranked shortlist based on strength of evidence, not estimated earnings.
+If the supplied evidence is insufficient for a candidate, do not fill the gap
+with general knowledge. Mark it Not verified and explain what is missing.
 Return a structured professional report.
 """
 
@@ -868,10 +993,15 @@ def run_agent_workflow(request: ResearchRequest):
         }
 
         current_agent = "Verification Agent"
-        official_site_evidence = collect_official_site_evidence(web_results)
+        discovered_candidates, candidate_searches, candidate_search_results = (
+            collect_candidate_specific_evidence(discovery, web_results)
+        )
+        official_site_evidence = collect_official_site_evidence(
+            candidate_search_results
+        )
         verification = run_verification_agent(
             discovery,
-            web_results,
+            candidate_searches,
             official_site_evidence
         )
         completed["verification"] = {
@@ -910,7 +1040,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.2.0",
+            "version": "7.3.0",
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
             "niche": request.niche,
@@ -921,6 +1051,9 @@ def run_agent_workflow(request: ResearchRequest):
                 "detail": error.detail
             },
             "completed_agents": completed,
+            "discovered_candidates": discovered_candidates if "discovered_candidates" in locals() else [],
+            "candidate_searches": candidate_searches if "candidate_searches" in locals() else [],
+            "official_site_evidence": official_site_evidence if "official_site_evidence" in locals() else {},
             "source_results": web_results
         }
 
@@ -929,7 +1062,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.2.0",
+            "version": "7.3.0",
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
             "niche": request.niche,
@@ -940,19 +1073,24 @@ def run_agent_workflow(request: ResearchRequest):
                 "detail": "Unexpected agent error. Check Railway logs."
             },
             "completed_agents": completed,
+            "discovered_candidates": discovered_candidates if "discovered_candidates" in locals() else [],
+            "candidate_searches": candidate_searches if "candidate_searches" in locals() else [],
+            "official_site_evidence": official_site_evidence if "official_site_evidence" in locals() else {},
             "source_results": web_results
         }
 
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "7.2.0",
+        "version": "7.3.0",
         "workflow": "Five-Agent Affiliate Intelligence System",
         "model": MODEL_NAME,
         "niche": request.niche,
         "search_results_found": len(web_results),
         "agents": completed,
         "source_results": web_results,
+        "discovered_candidates": discovered_candidates,
+        "candidate_searches": candidate_searches,
         "official_site_evidence": official_site_evidence
     }
 
@@ -966,7 +1104,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "7.2.0",
+        "version": "7.3.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
