@@ -21,13 +21,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.8: strict affiliate application-route validation, safer Gemini rate-limit handling, and retained v8.6 evidence/readiness controls.
+# v8.9: fixes hyphenated cookie-duration extraction and enforces report-to-ledger term consistency; retains v8.8 Gemini pacing.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="8.8.0"
+    version="8.9.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -709,6 +709,22 @@ def _commission_percentage_from_sentence(sentence):
     return None
 
 
+def _extract_duration_value(text):
+    """Parse common duration formats, including hyphenated forms such as 30-day."""
+    match = re.search(
+        r"(?i)\b(\d{1,4})\s*[- ]?\s*(days?|weeks?|months?)\b",
+        str(text or "")
+    )
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    # Store normalized plural units so equivalent forms compare consistently.
+    unit = {"day": "days", "days": "days", "week": "weeks", "weeks": "weeks",
+            "month": "months", "months": "months"}[unit]
+    return f"{amount} {unit}"
+
+
 def _extract_explicit_terms(text):
     """Extract numeric terms only when the sentence semantically connects value and term."""
     commission = "Not verified"
@@ -726,10 +742,10 @@ def _extract_explicit_terms(text):
             if commission_value:
                 commission = commission_value
                 evidence.append({"term": "commission", "value": commission, "excerpt": sentence[:350]})
-        if cookie == "Not verified" and re.search(r"(?i)\bcookie\b", sentence):
-            m = re.search(r"(?i)\b(\d{1,4}\s*(?:days?|weeks?|months?))\b", sentence)
-            if m:
-                cookie = re.sub(r"\s+", " ", m.group(1)).strip()
+        if cookie == "Not verified" and re.search(r"(?i)\bcookies?\b", sentence):
+            duration_value = _extract_duration_value(sentence)
+            if duration_value:
+                cookie = duration_value
                 evidence.append({"term": "cookie_duration", "value": cookie, "excerpt": sentence[:350]})
         if commission != "Not verified" and cookie != "Not verified":
             break
@@ -1154,9 +1170,8 @@ def _term_evidence_is_authoritative(record, term_name, value):
             parsed_value = _commission_percentage_from_sentence(excerpt)
             context_ok = bool(parsed_value and re.sub(r"\s+", "", parsed_value).lower() == re.sub(r"\s+", "", str(value)).lower())
         elif term_name == "cookie_duration":
-            match = re.search(r"(?i)\bcookie\b", excerpt)
-            duration = re.search(r"(?i)\b(\d{1,4}\s*(?:days?|weeks?|months?))\b", excerpt)
-            parsed_value = re.sub(r"\s+", " ", duration.group(1)).strip() if duration else None
+            match = re.search(r"(?i)\bcookies?\b", excerpt)
+            parsed_value = _extract_duration_value(excerpt)
             context_ok = bool(match and parsed_value and parsed_value.lower() == str(value).lower())
         else:
             context_ok = False
@@ -1200,8 +1215,8 @@ def _line_has_unsupported_term_claim(line, candidate):
         if commission == "Not verified" and _commission_percentage_from_sentence(sentence):
             reasons.append("commission is Not verified")
         if cookie == "Not verified":
-            has_cookie_context = bool(re.search(r"(?i)\bcookie\b", sentence))
-            has_duration = bool(re.search(r"(?i)\b\d{1,4}\s*(?:days?|weeks?|months?)\b", sentence))
+            has_cookie_context = bool(re.search(r"(?i)\bcookies?\b", sentence))
+            has_duration = bool(_extract_duration_value(sentence))
             if has_cookie_context and has_duration:
                 reasons.append("cookie duration is Not verified")
             elif has_cookie_context and re.search(
@@ -1216,9 +1231,9 @@ def _line_has_unsupported_term_claim(line, candidate):
 def _normalize_report_version(report_text):
     """Replace stale self-reported platform versions in generated agent prose."""
     text = str(report_text or "")
-    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-6](?:\.0)?", r"\g<1>8.7.0", text)
-    text = re.sub(r"(?i)(\bversion\s+)8\.[0-6](?:\.0)?", r"\g<1>8.7.0", text)
-    text = re.sub(r"(?i)(\bv)8\.[0-6](?:\.0)?\b", r"\g<1>8.7.0", text)
+    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-8](?:\.0)?", r"\g<1>8.9.0", text)
+    text = re.sub(r"(?i)(\bversion\s+)8\.[0-8](?:\.0)?", r"\g<1>8.9.0", text)
+    text = re.sub(r"(?i)(\bv)8\.[0-8](?:\.0)?\b", r"\g<1>8.9.0", text)
     return text
 
 
@@ -1367,6 +1382,12 @@ def build_agent_consistency_audit(records, agent_reports):
                         "candidate": name, "agent": agent_name, "ledger_status": status,
                         "issue": reason,
                         "claim_excerpt": line[:350],
+                        "claim_type": "commission" if "commission" in reason.lower() else "cookie_duration",
+                        "ledger_value": record.get("commission" if "commission" in reason.lower() else "cookie_duration", "Not verified"),
+                        "supporting_evidence_urls": [
+                            item.get("evidence_url") for item in (record.get("term_evidence") or [])
+                            if item.get("term") == ("commission" if "commission" in reason.lower() else "cookie_duration")
+                        ],
                         "severity": "unsupported_agent_term"
                     })
 
@@ -1421,7 +1442,7 @@ def build_agent_consistency_audit(records, agent_reports):
         "audit_method": (
             "Candidate-host identity and source-host checks; exact-value semantic evidence matching; "
             "candidate-scoped sentence attribution; sentence-level commission and cookie validation; unsupported qualitative cookie claims; "
-            "candidate-level program-status and verified-ranking consistency checks."
+            "candidate-level program-status and verified-ranking consistency checks; report commission/cookie claims are checked against the same candidate ledger record."
         ),
         "note": (
             "Rule-based checks cannot authenticate legal domain ownership or understand every paraphrase. "
@@ -1433,12 +1454,12 @@ def build_agent_consistency_audit(records, agent_reports):
 def build_report_metadata(agent_reports):
     """Report stale agent version labels without silently treating them as evidence issues."""
     stale = []
-    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-6](?:\.0)?\b")
+    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-8](?:\.0)?\b")
     for agent_name, report in (agent_reports or {}).items():
         if version_pattern.search(str(report or "")):
             stale.append(agent_name)
     return {
-        "application_version": "8.8.0",
+        "application_version": "8.9.0",
         "agent_reports_with_stale_version_labels": stale,
         "status": "passed" if not stale else "review_required",
         "version_policy": "All agent prompts and generated report version labels must match the running application version."
@@ -2199,7 +2220,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.8.0",
+            "version": "8.9.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2238,7 +2259,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.8.0",
+            "version": "8.9.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2299,7 +2320,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "8.8.0",
+        "version": "8.9.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2348,7 +2369,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "8.8.0",
+        "version": "8.9.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
