@@ -20,13 +20,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.3: version-consistent reports, semantic evidence enforcement, cross-agent consistency checks, and guarded strategy fallback.
+# v8.4: source traceability, candidate-specific verification retries, first-party payout context extraction, semantic evidence enforcement, and cross-agent consistency checks.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="8.3.0"
+    version="8.4.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -303,6 +303,22 @@ def collect_candidate_specific_evidence(discovery_report: str, general_search_re
         name = candidate['candidate']
         query = f'"{name}" official website affiliate partner program'
         results = search_web(query, max_results=3)
+        primary_count = len(results or [])
+        retry_queries = []
+        if not results:
+            retry_queries = [
+                f'"{name}" affiliate program',
+                f'"{name}" referral partner commission official'
+            ]
+            retry_seen = set()
+            for retry_query in retry_queries:
+                for retry_item in search_web(retry_query, max_results=2):
+                    retry_url = retry_item.get('href') or retry_item.get('url')
+                    if retry_url and retry_url not in retry_seen:
+                        retry_item = dict(retry_item)
+                        retry_item['_retry_query'] = retry_query
+                        results.append(retry_item)
+                        retry_seen.add(retry_url)
         cleaned = []
 
         for item in results:
@@ -311,7 +327,8 @@ def collect_candidate_specific_evidence(discovery_report: str, general_search_re
                 continue
             record = {
                 'candidate': name,
-                'search_query': query,
+                'search_query': item.get('_retry_query') or query,
+                'search_stage': 'retry' if item.get('_retry_query') else 'primary',
                 'title': item.get('title', ''),
                 'url': url,
                 'description': item.get('body', '')
@@ -325,6 +342,9 @@ def collect_candidate_specific_evidence(discovery_report: str, general_search_re
             'rank': candidate['rank'],
             'category': candidate['category'],
             'query': query,
+            'primary_results_found': primary_count,
+            'retry_queries': retry_queries,
+            'retry_results_found': max(0, len(cleaned) - primary_count),
             'results_found': len(cleaned),
             'results': cleaned
         })
@@ -491,7 +511,7 @@ def collect_official_site_evidence(search_results):
             continue
         seen.add(url)
         candidates.append({"url": url, "candidate": item.get("candidate", "Unassigned")})
-        if len(candidates) >= 24:
+        if len(candidates) >= 40:
             break
 
     for item in candidates:
@@ -810,6 +830,8 @@ def build_structured_evidence_records(
         commission, cookie_duration = "Not verified", "Not verified"
         term_evidence = []
         third_party_term_claims = []
+        payout_claims = []
+        official_program_page_evidence = []
         for page in nonmatching_pages:
             _, _, third_party_terms = _extract_explicit_terms(_page_text(page))
             for claim in third_party_terms:
@@ -826,6 +848,30 @@ def build_structured_evidence_records(
             page_text = _page_text(page)
             page_commission, page_cookie, extracted = _extract_explicit_terms(page_text)
             page_url = page.get("final_url") or page.get("requested_url")
+            # Preserve concise first-party context even when a variable/up-to payout is not
+            # equivalent to a fixed commission rate and must not enter the verified field.
+            relevant_sentences = []
+            for sentence in re.split(r"(?<=[.!?;])\s+|\n+", re.sub(r"\s+", " ", page_text)):
+                sentence = sentence.strip()
+                if sentence and re.search(r"(?i)\b(?:affiliate|referral|commission|payout|qualified referral|earn up to)\b", sentence):
+                    relevant_sentences.append(sentence[:450])
+                if len(relevant_sentences) >= 8:
+                    break
+            official_program_page_evidence.append({
+                "url": page_url,
+                "page_title": page.get("title", ""),
+                "source_host": _host(page_url),
+                "evidence_excerpt": relevant_sentences,
+                "evidence_scope": "First-party program-page context; excerpts are not automatically verified numeric terms"
+            })
+            for sentence in relevant_sentences:
+                if re.search(r"(?i)\b(?:up to|qualified referral|payout rates|varies by|per referral)\b", sentence) and re.search(r"[$€£]\s?\d", sentence):
+                    payout_claims.append({
+                        "claim": sentence,
+                        "evidence_url": page_url,
+                        "status": "Observed first-party payout statement — not a fixed verified commission rate",
+                        "must_not_be_used_as": "fixed commission percentage or guaranteed payout"
+                    })
             for item in extracted:
                 item["evidence_url"] = page_url
                 item["source_authority"] = "candidate-host page; domain ownership not independently authenticated"
@@ -886,6 +932,8 @@ def build_structured_evidence_records(
             "last_checked_utc": checked_at,
             "confidence": confidence,
             "term_evidence": term_evidence,
+            "official_program_page_evidence": official_program_page_evidence,
+            "first_party_payout_claims": payout_claims,
             "third_party_term_claims": third_party_term_claims,
             "unknowns": [
                 "Legal ownership of the candidate domain is not independently authenticated.",
@@ -979,9 +1027,9 @@ def _line_has_unsupported_term_claim(line, candidate):
 def _normalize_report_version(report_text):
     """Replace stale self-reported platform versions in generated agent prose."""
     text = str(report_text or "")
-    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-2](?:\.0)?", r"\g<1>8.3.0", text)
-    text = re.sub(r"(?i)(\bversion\s+)8\.[0-2](?:\.0)?", r"\g<1>8.3.0", text)
-    text = re.sub(r"(?i)(\bv)8\.[0-2](?:\.0)?\b", r"\g<1>8.3.0", text)
+    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-3](?:\.0)?", r"\g<1>8.4.0", text)
+    text = re.sub(r"(?i)(\bversion\s+)8\.[0-3](?:\.0)?", r"\g<1>8.4.0", text)
+    text = re.sub(r"(?i)(\bv)8\.[0-3](?:\.0)?\b", r"\g<1>8.4.0", text)
     return text
 
 
@@ -1041,7 +1089,7 @@ def build_enforcement_summary(records, ledger_findings, report_findings):
         "agent_claims_blocked": len(report_findings or []),
         "ledger_findings": ledger_findings or [],
         "blocked_agent_claims": report_findings or [],
-        "rule": "Only exact numeric terms supported by focused candidate-host program-page excerpts remain verified. Commission percentages must be grammatically tied to commission; unrelated percentages such as conversion lifts are rejected. Unsupported numeric and qualitative term claims are replaced before downstream use."
+        "rule": "Only exact numeric terms supported by focused candidate-host program-page excerpts remain verified. Commission percentages must be grammatically tied to commission; unrelated percentages and variable “up to” payout statements are not treated as fixed commission rates. Unsupported numeric and qualitative term claims are replaced before downstream use."
     }
 
 
@@ -1186,12 +1234,12 @@ def build_agent_consistency_audit(records, agent_reports):
 def build_report_metadata(agent_reports):
     """Report stale agent version labels without silently treating them as evidence issues."""
     stale = []
-    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-2](?:\.0)?\b")
+    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-3](?:\.0)?\b")
     for agent_name, report in (agent_reports or {}).items():
         if version_pattern.search(str(report or "")):
             stale.append(agent_name)
     return {
-        "application_version": "8.3.0",
+        "application_version": "8.4.0",
         "agent_reports_with_stale_version_labels": stale,
         "status": "passed" if not stale else "review_required",
         "version_policy": "All agent prompts and generated report version labels must match the running application version."
@@ -1250,7 +1298,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 8.3.
+You are the Market Discovery Agent of Affiliate Intelligence, version 8.4.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1375,7 +1423,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 8.3.
+You are the Verification Agent of Affiliate Intelligence, version 8.4.
 
 V8 STRICT EVIDENCE RULES:
 - The structured ledger is deterministic and authoritative; do not upgrade it.
@@ -1928,7 +1976,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.3.0",
+            "version": "8.4.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1961,7 +2009,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.3.0",
+            "version": "8.4.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2016,7 +2064,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "8.3.0",
+        "version": "8.4.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2032,6 +2080,15 @@ def run_agent_workflow(request: ResearchRequest):
         "source_results": web_results,
         "discovered_candidates": discovered_candidates,
         "candidate_searches": candidate_searches,
+        "verification_retry": {
+            "candidates_retried": sum(1 for item in candidate_searches if item.get("retry_queries")),
+            "retry_queries_run": sum(len(item.get("retry_queries", [])) for item in candidate_searches),
+            "retry_results_found": sum(item.get("retry_results_found", 0) for item in candidate_searches),
+            "candidates_still_without_candidate_specific_sources": [
+                item.get("candidate") for item in candidate_searches if not item.get("results_found")
+            ],
+            "note": "Retries improve source discovery but search results remain leads, not verification."
+        },
         "official_site_evidence": official_site_evidence,
         "structured_evidence_records": structured_evidence_records
     }
@@ -2046,7 +2103,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "8.3.0",
+        "version": "8.4.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
