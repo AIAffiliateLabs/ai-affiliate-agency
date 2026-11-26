@@ -1,6 +1,7 @@
 
 import os
 import time
+import threading
 import json
 import re
 import ipaddress
@@ -20,16 +21,21 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.7: strict affiliate application-route validation, safer Gemini rate-limit handling, and retained v8.6 evidence/readiness controls.
+# v8.8: strict affiliate application-route validation, safer Gemini rate-limit handling, and retained v8.6 evidence/readiness controls.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="8.7.0"
+    version="8.8.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
+
+# Free-tier-friendly pacing: serialize calls and leave a buffer below common RPM limits.
+GEMINI_MIN_INTERVAL_SECONDS = 35
+_gemini_call_lock = threading.Lock()
+_gemini_last_call_started = 0.0
 
 DEFAULT_NICHE = (
     "Discover promising affiliate opportunities "
@@ -75,58 +81,86 @@ def get_gemini_client():
 
 
 def generate_ai_response(prompt: str):
-    """Call the configured Gemini model with bounded retries for service outages.
+    """Call Gemini with conservative pacing and safe error handling.
 
-    HTTP 429 is returned immediately: repeating a request when the provider has
-    exhausted a quota usually wastes time and can worsen rate pressure. The app
-    never changes models, keys, quotas, or billing automatically.
+    Calls are serialized within this application process and spaced at least
+    35 seconds apart. This can help with per-minute request limits, but cannot
+    restore an exhausted daily/monthly quota. HTTP 429 is never retried.
     """
+    global _gemini_last_call_started
     client = get_gemini_client()
-    max_attempts = 3  # Initial attempt plus at most two retries for HTTP 503 only.
-    last_error = None
 
-    for attempt in range(max_attempts):
+    with _gemini_call_lock:
+        now = time.monotonic()
+        wait_seconds = GEMINI_MIN_INTERVAL_SECONDS - (now - _gemini_last_call_started)
+        if _gemini_last_call_started > 0 and wait_seconds > 0:
+            print(
+                f"Gemini pacing: waiting {wait_seconds:.1f}s before next request. "
+                f"Prompt characters={len(prompt)}"
+            )
+            time.sleep(wait_seconds)
+
+        _gemini_last_call_started = time.monotonic()
+        started_at = _gemini_last_call_started
         try:
             response = client.models.generate_content(
                 model=MODEL_NAME,
                 contents=prompt
+            )
+            elapsed = time.monotonic() - started_at
+            usage = getattr(response, "usage_metadata", None)
+            usage_summary = "unavailable"
+            if usage is not None:
+                usage_summary = {
+                    "prompt_token_count": getattr(usage, "prompt_token_count", None),
+                    "candidates_token_count": getattr(usage, "candidates_token_count", None),
+                    "total_token_count": getattr(usage, "total_token_count", None),
+                }
+            print(
+                f"Gemini success: model={MODEL_NAME}, elapsed={elapsed:.1f}s, "
+                f"prompt_characters={len(prompt)}, usage={usage_summary}"
             )
             if not response.text:
                 raise RuntimeError("Gemini returned an empty response.")
             return response.text
 
         except Exception as error:
-            last_error = error
             error_message = str(error)
-            print(f"Gemini error on attempt {attempt + 1}/{max_attempts}: {error_message}")
-
+            print(
+                f"Gemini request failed: model={MODEL_NAME}, "
+                f"prompt_characters={len(prompt)}, "
+                f"elapsed={time.monotonic() - started_at:.1f}s, "
+                f"error={error_message[:1200]}"
+            )
             is_rate_limited = "429" in error_message or "RESOURCE_EXHAUSTED" in error_message
             is_unavailable = "503" in error_message or "UNAVAILABLE" in error_message
 
             if is_rate_limited:
+                lower_error = error_message.lower()
+                if "per minute" in lower_error or "rpm" in lower_error or "requests per" in lower_error:
+                    reason = "The provider response appears to indicate a request-rate limit."
+                elif "per day" in lower_error or "rpd" in lower_error or "daily" in lower_error:
+                    reason = "The provider response appears to indicate a daily quota limit."
+                elif "tokens per minute" in lower_error or "tpm" in lower_error:
+                    reason = "The provider response appears to indicate a token-throughput limit."
+                else:
+                    reason = "The provider did not expose enough detail to classify the quota limit."
                 raise HTTPException(
                     status_code=429,
                     detail=(
-                        "Gemini returned HTTP 429 (rate limit or quota). The request "
-                        "was not repeated because quota-related 429 responses are not "
-                        "reliably fixed by immediate retries. Wait for the provider's "
-                        "quota window to reset, then retry once. No billing, model, "
-                        "or API-key settings were changed."
+                        "Gemini returned HTTP 429. " + reason + " "
+                        "The request was not repeated. Check the detailed Railway log "
+                        "message for the provider's quota metric and reset time. "
+                        "No billing, model, or API-key settings were changed."
                     )
                 )
 
             if is_unavailable:
-                if attempt < max_attempts - 1:
-                    wait_seconds = min(5 * (2 ** attempt), 15)
-                    print(f"Gemini unavailable; retrying in {wait_seconds} seconds.")
-                    time.sleep(wait_seconds)
-                    continue
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "Gemini remained unavailable after bounded retries. "
-                        "Completed agent results, if any, are preserved in the "
-                        "workflow error response."
+                        "Gemini is temporarily unavailable. No immediate retry was made; "
+                        "completed agent results are preserved in the workflow response."
                     )
                 )
 
@@ -137,11 +171,6 @@ def generate_ai_response(prompt: str):
                     "Check Railway logs for the underlying error."
                 )
             )
-
-    raise HTTPException(
-        status_code=503,
-        detail=f"Gemini request failed after retries: {str(last_error)[:250]}"
-    )
 
 
 # ==========================================
@@ -1293,7 +1322,7 @@ def _candidate_claim_sentences(report_text, candidate_name):
 
 
 def _candidate_claim_lines(report_text, candidate_name):
-    """Backward-compatible alias; attribution is sentence-scoped in v8.7."""
+    """Backward-compatible alias; attribution is sentence-scoped in v8.8."""
     return _candidate_claim_sentences(report_text, candidate_name)
 
 
@@ -1409,7 +1438,7 @@ def build_report_metadata(agent_reports):
         if version_pattern.search(str(report or "")):
             stale.append(agent_name)
     return {
-        "application_version": "8.7.0",
+        "application_version": "8.8.0",
         "agent_reports_with_stale_version_labels": stale,
         "status": "passed" if not stale else "review_required",
         "version_policy": "All agent prompts and generated report version labels must match the running application version."
@@ -2170,7 +2199,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.7.0",
+            "version": "8.8.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2209,7 +2238,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.7.0",
+            "version": "8.8.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2270,7 +2299,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "8.7.0",
+        "version": "8.8.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2319,7 +2348,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "8.7.0",
+        "version": "8.8.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
