@@ -247,3 +247,82 @@ def analyze_affiliate(request: AffiliateAnalysisRequest):
         "product": request.product_name,
         "analysis": result
     }
+
+@app.post("/full-workflow")
+def full_workflow(request: ResearchRequest):
+
+    # STEP 1: Research Agent
+    research_prompt = f"""
+    You are the Research Agent of an AI and SaaS affiliate agency.
+
+    Research potential affiliate opportunities in this niche:
+    {request.niche}
+
+    Identify up to {request.number_of_programs} potential products.
+
+    For each product include:
+    - Company name
+    - Product name
+    - Product category
+    - Target audience
+    - Possible affiliate program
+    - Possible commission model
+    - Marketing potential
+
+    IMPORTANT:
+    No live web search is available.
+    Do not invent commission rates or cookie durations.
+    Mark unverified information clearly.
+    Do not invent sources or URLs.
+
+    Return a structured report.
+    """
+
+    research_result = generate_ai_response(research_prompt)
+
+    # STEP 2: Affiliate Analyst
+    analysis_prompt = f"""
+    You are the Affiliate Analyst of an AI and SaaS affiliate agency.
+
+    Analyze the following research report:
+
+    {research_result}
+
+    Evaluate each identified opportunity based on:
+
+    1. Product value
+    2. Target audience
+    3. Market demand
+    4. Affiliate commission potential
+    5. Recurring revenue potential
+    6. Competition
+    7. Marketing difficulty
+    8. Advantages and disadvantages
+    9. Business risks
+
+    IMPORTANT:
+    - Do not invent commission rates.
+    - Do not invent cookie durations.
+    - Mark unverified details clearly.
+    - Distinguish facts from estimates.
+    - Do not promise earnings.
+
+    Finish with:
+    - Ranked opportunities
+    - Best three opportunities for further verification
+    - Final recommendations
+    - Next steps
+
+    Return a professional analysis.
+    """
+
+    analysis_result = generate_ai_response(analysis_prompt)
+
+    return {
+        "status": "success",
+        "workflow": "Research to Recommendation",
+        "model": MODEL_NAME,
+        "niche": request.niche,
+        "research_report": research_result,
+        "final_analysis": analysis_result
+    }
