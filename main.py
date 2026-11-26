@@ -21,13 +21,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.9: fixes hyphenated cookie-duration extraction and enforces report-to-ledger term consistency; retains v8.8 Gemini pacing.
+# v9.3: adds candidate-scoped source provenance, public-page reachability and CTA link validation; preserves v9.2 Evidence Gate.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="9.2.0"
+    version="9.3.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -2236,7 +2236,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.2.0",
+            "version": "9.3.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2275,7 +2275,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.2.0",
+            "version": "9.3.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2336,7 +2336,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "9.2.0",
+        "version": "9.3.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2485,6 +2485,157 @@ def enforce_content_evidence(content, candidate_record):
 
 
 # ==========================================
+# SOURCE ATTRIBUTION & LINK VALIDATION — v9.3
+# ==========================================
+
+_URL_RE = re.compile(r"https?://[^\s<>\]\[\)\}\"']+", re.IGNORECASE)
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", re.IGNORECASE)
+
+
+def _clean_url(url):
+    return str(url or "").strip().rstrip(".,;:!?)\"'`")
+
+
+def _walk_urls(value):
+    found = []
+    if isinstance(value, dict):
+        for child in value.values():
+            found.extend(_walk_urls(child))
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            found.extend(_walk_urls(child))
+    elif isinstance(value, str):
+        found.extend(_clean_url(match.group(0)) for match in _URL_RE.finditer(value))
+    return found
+
+
+def _candidate_related_page(page, candidate):
+    candidate_key = _candidate_key(candidate)
+    page_text = " ".join([
+        str(page.get("candidate", "")), str(page.get("title", "")),
+        str(page.get("description", "")), str(page.get("text_excerpt", "")),
+        str(page.get("requested_url", "")), str(page.get("final_url", ""))
+    ])
+    return bool(candidate_key and candidate_key in _candidate_key(page_text))
+
+
+def validate_content_sources_and_links(content, candidate_record, workflow):
+    """Validate citation provenance, public-page reachability and obvious CTA mismatch.
+
+    This check does not claim semantic fact verification: a reachable URL or a
+    matching domain is not proof that the page supports a particular sentence.
+    """
+    text = str(content or "")
+    candidate = candidate_record.get("candidate", "")
+    verification_report = ((workflow.get("agents") or {}).get("verification") or {}).get("report", "")
+    competition_report = ((workflow.get("agents") or {}).get("competition") or {}).get("report", "")
+    financial_report = ((workflow.get("agents") or {}).get("financial_analyst") or {}).get("report", "")
+    strategy_report = ((workflow.get("agents") or {}).get("chief_strategy") or {}).get("report", "")
+
+    evidence_urls = set(_walk_urls(candidate_record))
+    report_urls = set(_walk_urls(verification_report))
+    # Other reports are allowed only as candidate-specific leads, not as official proof.
+    related_report_urls = set()
+    candidate_key = _candidate_key(candidate)
+    for report_text in (competition_report, financial_report, strategy_report):
+        if candidate_key and candidate_key in _candidate_key(report_text):
+            related_report_urls.update(_walk_urls(report_text))
+    pages = (workflow.get("official_site_evidence") or {}).get("pages", [])
+    matching_pages = [page for page in pages if _candidate_related_page(page, candidate)]
+    page_urls = set()
+    for page in matching_pages:
+        page_urls.update(_walk_urls(page))
+
+    # The verification report is candidate-scoped by the workflow's selected ledger record.
+    allowed_urls = evidence_urls | report_urls | page_urls | related_report_urls
+    normalized_allowed = {_clean_url(url) for url in allowed_urls if _clean_url(url)}
+
+    content_urls = list(dict.fromkeys(_clean_url(u) for u in _walk_urls(text)))
+    findings = []
+    source_checks = []
+    checked_pages = {}
+
+    for url in content_urls[:8]:
+        if url not in normalized_allowed:
+            findings.append({
+                "type": "unsupported_source_reference",
+                "url": url,
+                "severity": "review_required",
+                "reason": "URL was not found in the selected candidate's Evidence Ledger or candidate-specific workflow reports."
+            })
+            continue
+        # Fetch only candidate-scoped, already supplied URLs. Fetch failures are not treated as proof of invalidity.
+        if url not in checked_pages:
+            checked_pages[url] = inspect_public_page(url)
+        page_result = checked_pages[url]
+        source_checks.append({
+            "url": url,
+            "provenance": "candidate_workflow_evidence",
+            "page_status": page_result.get("status", "unknown"),
+            "page_title": page_result.get("title", ""),
+            "final_url": page_result.get("final_url", ""),
+            "note": "Reachability and page metadata only; semantic support for individual claims requires human review."
+        })
+        if page_result.get("status") != "inspected":
+            findings.append({
+                "type": "source_unreachable_or_uninspected",
+                "url": url,
+                "severity": "review_required",
+                "reason": page_result.get("reason", page_result.get("status", "Page could not be inspected."))
+            })
+
+    # Remove links that are not grounded in this candidate's workflow evidence.
+    def strip_unsupported_link(match):
+        label, raw_url = match.group(1), _clean_url(match.group(2))
+        if raw_url not in normalized_allowed:
+            return label + " [link requires source verification]"
+        return match.group(0)
+    text = _MARKDOWN_LINK_RE.sub(strip_unsupported_link, text)
+
+    # Flag an obvious mismatch: a learner-facing CTA should not send users to an affiliate application page.
+    for label, raw_url in _MARKDOWN_LINK_RE.findall(text):
+        anchor = label.lower()
+        path = urlparse(raw_url).path.lower()
+        learner_cta = bool(re.search(r"\b(?:learn more|explore|browse|view|discover|classes|courses|start learning)\b", anchor))
+        partner_destination = any(term in path for term in ("affiliate", "partner", "referral", "ambassador"))
+        if learner_cta and partner_destination:
+            findings.append({
+                "type": "cta_destination_mismatch",
+                "url": raw_url,
+                "anchor_text": label,
+                "severity": "review_required",
+                "reason": "Learner-facing CTA points to a partner/affiliate information path rather than an obvious learner destination."
+            })
+
+    # Source list entries should be candidate-specific and grounded in the workflow.
+    source_section = re.search(r"(?ims)^\s*(?:#{1,6}\s*)?(?:D\.?\s*)?Sources used.*?(?=^\s*(?:#{1,6}\s*)?(?:E\.?\s*)|\Z)", text)
+    if source_section:
+        for url in list(dict.fromkeys(_clean_url(u) for u in _walk_urls(source_section.group(0)))):
+            if url not in normalized_allowed:
+                findings.append({
+                    "type": "unattributed_source_list_entry",
+                    "url": url,
+                    "severity": "review_required",
+                    "reason": "Listed source is not present in the selected candidate's evidence or candidate-specific reports."
+                })
+
+    return text, {
+        "status": "review_required" if findings else "passed",
+        "candidate": candidate,
+        "content_urls_found": len(content_urls),
+        "candidate_evidence_urls_available": len(normalized_allowed),
+        "source_pages_checked": source_checks,
+        "findings_count": len(findings),
+        "findings": findings,
+        "limitations": [
+            "A URL being present in the workflow does not prove that it supports a specific factual claim.",
+            "Page reachability and title metadata are not semantic fact-checking.",
+            "Human review is required for claim-to-source matching and CTA suitability."
+        ]
+    }
+
+
+# ==========================================
 # AGENT 6 — CONTENT CREATION
 # ==========================================
 
@@ -2523,8 +2674,13 @@ def run_content_creation_agent(request: ContentCreationRequest):
 
     selected_record = json.dumps(selected, ensure_ascii=False, indent=2)
     prompt = f"""
-You are the Content Creation Agent, Agent 6 of Affiliate Intelligence v9.2.
+You are the Content Creation Agent, Agent 6 of Affiliate Intelligence v9.3.
 Create ONE polished, useful, original marketing content asset for human review.
+SOURCE ATTRIBUTION RULES
+- Every URL in the Sources Used section must be present in the selected candidate's evidence record or candidate-specific workflow reports.
+- Do not invent, reconstruct, or substitute URLs. Use the most relevant destination for the audience's CTA; an affiliate application page is not a learner-facing classes page.
+- Do not imply that a source supports a claim unless its supplied excerpt directly supports that claim. If excerpts are absent, mark the claim for human source review.
+- Keep source references concise and distinguish official candidate-host pages from third-party commentary.
 
 USER REQUEST
 - Candidate: {request.candidate}
@@ -2587,10 +2743,14 @@ structure to the requested content type. Return the result in {request.language}
 
     generated_result = generate_ai_response(prompt)
     result, quality_control = enforce_content_evidence(generated_result, selected)
+    result, source_link_quality = validate_content_sources_and_links(result, selected, workflow)
+    quality_control["source_attribution_and_link_validation"] = source_link_quality
+    if source_link_quality.get("status") != "passed" and quality_control.get("status") == "passed":
+        quality_control["status"] = "review_required"
     return {
         "status": "draft_created",
         "project": "Affiliate Intelligence",
-        "version": "9.2.0",
+        "version": "9.3.0",
         "agent": "Content Creation Agent",
         "candidate": request.candidate,
         "content_type": request.content_type,
@@ -2609,7 +2769,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "9.2.0",
+        "version": "9.3.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 6
