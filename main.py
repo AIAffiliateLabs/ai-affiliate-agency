@@ -20,13 +20,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.4: source traceability, candidate-specific verification retries, first-party payout context extraction, semantic evidence enforcement, and cross-agent consistency checks.
+# v8.5: candidate-scoped sentence attribution, expanded source recovery, and evidence-tiered strategy, candidate-specific verification retries, first-party payout context extraction, semantic evidence enforcement, and cross-agent consistency checks.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="8.4.0"
+    version="8.5.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -307,8 +307,10 @@ def collect_candidate_specific_evidence(discovery_report: str, general_search_re
         retry_queries = []
         if not results:
             retry_queries = [
-                f'"{name}" affiliate program',
-                f'"{name}" referral partner commission official'
+                f'"{name}" affiliate program official website',
+                f'"{name}" affiliate referral partner commission',
+                f'"{name}" official affiliate referral program page',
+                f'"{name}" creator ambassador partner program'
             ]
             retry_seen = set()
             for retry_query in retry_queries:
@@ -345,6 +347,7 @@ def collect_candidate_specific_evidence(discovery_report: str, general_search_re
             'primary_results_found': primary_count,
             'retry_queries': retry_queries,
             'retry_results_found': max(0, len(cleaned) - primary_count),
+            'recovery_strategy': 'Four candidate-specific query variants when primary search returns no results' if retry_queries else 'Primary candidate-specific search returned results',
             'results_found': len(cleaned),
             'results': cleaned
         })
@@ -1027,55 +1030,51 @@ def _line_has_unsupported_term_claim(line, candidate):
 def _normalize_report_version(report_text):
     """Replace stale self-reported platform versions in generated agent prose."""
     text = str(report_text or "")
-    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-3](?:\.0)?", r"\g<1>8.4.0", text)
-    text = re.sub(r"(?i)(\bversion\s+)8\.[0-3](?:\.0)?", r"\g<1>8.4.0", text)
-    text = re.sub(r"(?i)(\bv)8\.[0-3](?:\.0)?\b", r"\g<1>8.4.0", text)
+    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-4](?:\.0)?", r"\g<1>8.5.0", text)
+    text = re.sub(r"(?i)(\bversion\s+)8\.[0-4](?:\.0)?", r"\g<1>8.5.0", text)
+    text = re.sub(r"(?i)(\bv)8\.[0-4](?:\.0)?\b", r"\g<1>8.5.0", text)
     return text
 
 
 def _sanitize_agent_report(report_text, records, agent_name):
-    """Block report lines that state unsupported numeric or qualitative terms."""
+    """Block unsupported claims only when the sentence explicitly names that candidate."""
     if not report_text:
         return report_text, []
     report_text = _normalize_report_version(report_text)
-    lines = str(report_text).splitlines()
-    findings = []
     by_name = {str(r.get("candidate", "")).lower(): r for r in records or []}
-    names = sorted([n for n in by_name if n], key=len, reverse=True)
+    findings = []
     output = []
-    active_candidate = None
 
-    for line in lines:
-        for name in names:
-            if re.search(r"(?i)(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", line):
-                active_candidate = name
-                break
-        candidate = by_name.get(active_candidate) if active_candidate else None
-        blocked_reasons = []
-
-        if candidate:
-            status = candidate.get("verification_status", "Not verified")
-            if status in ("Third-party evidence only", "Not verified",
-                          "Candidate-host website inspected — affiliate program not found in inspected pages",
-                          "B2B/agency/technology partnership observed — publisher affiliate program not established"):
-                if re.search(r"(?i)\b(?:verified shortlist|top recommendation|recommended opportunity|ranked (?:#?\d+|first|second|third)|ranked among verified|verified ranking)\b", line) and not re.search(
-                    r"(?i)\b(?:not|never|cannot|can't|unverified|unknown|unclear|provisional|excluded|do not)\b", line
-                ):
-                    blocked_reasons.append("candidate is not verified and cannot be promoted as a verified recommendation")
-
-            blocked_reasons.extend(_line_has_unsupported_term_claim(line, candidate))
-
-        if blocked_reasons:
-            findings.append({
-                "candidate": candidate.get("candidate"),
-                "agent": agent_name,
-                "blocked_claim": line.strip()[:300],
-                "reason": "; ".join(blocked_reasons)
-            })
-            output.append(
-                f"[BLOCKED BY EVIDENCE ENFORCEMENT — {candidate.get('candidate')}: "
-                f"{'; '.join(blocked_reasons)}] Claim withheld."
-            )
+    for line in str(report_text).splitlines():
+        sentences = _report_sentences(line)
+        blocked_for_line = []
+        for sentence in sentences:
+            clauses = re.split(r"(?i)\s+(?:whereas|while|but|however|although)\s+|\s+with\s+(?=[A-Z][A-Za-z0-9&.-]+\s+(?:provid(?:ing|es)?|report(?:ing|s)?|show(?:ing|s)?|offer(?:ing|s)?|hav(?:ing|es)|list(?:ing|s)?|stat(?:ing|es)|confirm(?:ing|s)?|includ(?:ing|es)))", sentence)
+            for clause in clauses:
+              for name, candidate in by_name.items():
+                if not name or not re.search(r"(?i)(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", clause):
+                    continue
+                blocked_reasons = []
+                status = candidate.get("verification_status", "Not verified")
+                if status in ("Third-party evidence only", "Not verified",
+                              "Candidate-host website inspected — affiliate program not found in inspected pages",
+                              "B2B/agency/technology partnership observed — publisher affiliate program not established"):
+                    if re.search(r"(?i)\b(?:verified shortlist|top recommendation|recommended opportunity|ranked (?:#?\d+|first|second|third)|ranked among verified|verified ranking)\b", clause) and not re.search(
+                        r"(?i)\b(?:not|never|cannot|can't|unverified|unknown|unclear|provisional|excluded|do not)\b", clause
+                    ):
+                        blocked_reasons.append("candidate is not verified and cannot be promoted as a verified recommendation")
+                blocked_reasons.extend(_line_has_unsupported_term_claim(clause, candidate))
+                if blocked_reasons:
+                    findings.append({
+                        "candidate": candidate.get("candidate"),
+                        "agent": agent_name,
+                        "blocked_claim": clause.strip()[:300],
+                        "reason": "; ".join(dict.fromkeys(blocked_reasons))
+                    })
+                    blocked_for_line.append(candidate.get("candidate"))
+        if blocked_for_line:
+            unique = ", ".join(dict.fromkeys(blocked_for_line))
+            output.append(f"[BLOCKED BY EVIDENCE ENFORCEMENT — {unique}] Unsupported candidate-specific claim withheld.")
         else:
             output.append(line)
 
@@ -1121,10 +1120,24 @@ def build_enforced_strategy_report(records, enforcement_summary):
     )
 
 
-def _candidate_claim_lines(report_text, candidate_name):
+def _candidate_claim_sentences(report_text, candidate_name):
+    """Return candidate-attributed clauses, not whole multi-brand paragraphs."""
     name_pattern = re.compile(rf"(?i)(?<![A-Za-z0-9]){re.escape(candidate_name)}(?![A-Za-z0-9])")
-    return [line.strip() for line in str(report_text or "").splitlines()
-            if name_pattern.search(line) and line.strip()]
+    claims = []
+    for line in str(report_text or "").splitlines():
+        for sentence in _report_sentences(line):
+            # Split contrastive/additive clauses so one named brand's terms are
+            # not attributed to another brand mentioned earlier in the sentence.
+            clauses = re.split(r"(?i)\s+(?:whereas|while|but|however|although)\s+|\s+with\s+(?=[A-Z][A-Za-z0-9&.-]+\s+(?:provid(?:ing|es)?|report(?:ing|s)?|show(?:ing|s)?|offer(?:ing|s)?|hav(?:ing|es)|list(?:ing|s)?|stat(?:ing|es)|confirm(?:ing|s)?|includ(?:ing|es)))", sentence)
+            for clause in clauses:
+                if name_pattern.search(clause):
+                    claims.append(clause.strip())
+    return claims
+
+
+def _candidate_claim_lines(report_text, candidate_name):
+    """Backward-compatible alias; attribution is sentence-scoped in v8.5."""
+    return _candidate_claim_sentences(report_text, candidate_name)
 
 
 def build_agent_consistency_audit(records, agent_reports):
@@ -1221,7 +1234,7 @@ def build_agent_consistency_audit(records, agent_reports):
         "findings": findings,
         "audit_method": (
             "Candidate-host identity and source-host checks; exact-value semantic evidence matching; "
-            "sentence-level commission and cookie validation; unsupported qualitative cookie claims; "
+            "candidate-scoped sentence attribution; sentence-level commission and cookie validation; unsupported qualitative cookie claims; "
             "candidate-level program-status and verified-ranking consistency checks."
         ),
         "note": (
@@ -1234,12 +1247,12 @@ def build_agent_consistency_audit(records, agent_reports):
 def build_report_metadata(agent_reports):
     """Report stale agent version labels without silently treating them as evidence issues."""
     stale = []
-    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-3](?:\.0)?\b")
+    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-4](?:\.0)?\b")
     for agent_name, report in (agent_reports or {}).items():
         if version_pattern.search(str(report or "")):
             stale.append(agent_name)
     return {
-        "application_version": "8.4.0",
+        "application_version": "8.5.0",
         "agent_reports_with_stale_version_labels": stale,
         "status": "passed" if not stale else "review_required",
         "version_policy": "All agent prompts and generated report version labels must match the running application version."
@@ -1298,7 +1311,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 8.4.
+You are the Market Discovery Agent of Affiliate Intelligence, version 8.5.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1423,7 +1436,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 8.4.
+You are the Verification Agent of Affiliate Intelligence, version 8.5.
 
 V8 STRICT EVIDENCE RULES:
 - The structured ledger is deterministic and authoritative; do not upgrade it.
@@ -1770,6 +1783,20 @@ FINAL DATA INTEGRITY CONTRACT:
 - Never rank by commission or cookie values unless focused term_evidence supports them.
 - Unknown commission is not zero and must never be converted to a zero-percent rate.
 - Do not silently reconcile conflicts between reports; list them as unresolved.
+- Use three distinct opportunity tiers and never blend them:
+  TIER 1 — PROGRAM EVIDENCE FOUND: a candidate-host publisher affiliate/referral page
+  was inspected. This is a research-qualified lead, not fully verified ownership,
+  application acceptance, payout eligibility or complete terms.
+  TIER 2 — PROGRAM EXISTENCE NOT ESTABLISHED: third-party-only, not verified,
+  candidate-host pages with no affiliate evidence, or ambiguous partnership types.
+  These may appear only in a separate research backlog, never in a verified shortlist.
+  TIER 3 — DISQUALIFIED: discontinued programs or clear non-affiliate partnerships
+  without publisher-facing evidence. Do not recommend for affiliate promotion.
+- A candidate with program-page evidence but unknown commission/cookie may still be
+  prioritized for manual follow-up based on product/market fit; explicitly state
+  those terms are unknown and do not invent financial projections from them.
+- Keep the strategy recommendation separate from verification status: "best next
+  candidate to investigate" is not the same as "verified affiliate offer".
 
 You are responsible for making the final strategic decision.
 
@@ -1976,7 +2003,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.4.0",
+            "version": "8.5.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2009,7 +2036,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.4.0",
+            "version": "8.5.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2064,7 +2091,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "8.4.0",
+        "version": "8.5.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2103,7 +2130,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "8.4.0",
+        "version": "8.5.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
