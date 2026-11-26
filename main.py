@@ -1,26 +1,48 @@
 
 import os
 import time
+import json
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from google import genai
+from ddgs import DDGS
 
 app = FastAPI(
-    title="AI Affiliate Agency",
-    description="AI-powered affiliate research platform",
-    version="4.0.0"
+    title="Affiliate Intelligence",
+    description="AI-powered affiliate market research platform",
+    version="5.0.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
+
+DEFAULT_NICHE = "Discover promising affiliate opportunities across all product categories"
+
+
+# ==========================================
+# REQUEST MODELS
+# ==========================================
+
 class ResearchRequest(BaseModel):
-    niche: str = "AI tools and SaaS software"
+    niche: str = DEFAULT_NICHE
     number_of_programs: int = Field(default=10, ge=1, le=10)
 
 
 class AIRequest(BaseModel):
     prompt: str
 
+
+class AffiliateAnalysisRequest(BaseModel):
+    company_name: str
+    product_name: str
+    product_description: str = "Not provided"
+    affiliate_details: str = "Not verified"
+    target_audience: str = "Not specified"
+
+
+# ==========================================
+# GEMINI CONNECTION
+# ==========================================
 
 def get_gemini_client():
     api_key = os.getenv("GEMINI_API_KEY")
@@ -56,7 +78,7 @@ def generate_ai_response(prompt: str):
             if "429" in error_message:
                 raise HTTPException(
                     status_code=429,
-                    detail="Gemini free-tier quota or rate limit reached. Try again later."
+                    detail="Gemini quota or rate limit reached. Try again later."
                 )
 
             if "503" in error_message:
@@ -66,7 +88,7 @@ def generate_ai_response(prompt: str):
 
                 raise HTTPException(
                     status_code=503,
-                    detail="Gemini is temporarily unavailable. Try again later."
+                    detail="Gemini is temporarily unavailable."
                 )
 
             raise HTTPException(
@@ -75,13 +97,223 @@ def generate_ai_response(prompt: str):
             )
 
 
+# ==========================================
+# WEB RESEARCH ENGINE
+# ==========================================
+
+def search_web(query: str, max_results: int = 4):
+    try:
+        results = DDGS().text(
+            query,
+            max_results=max_results,
+            region="us-en",
+            safesearch="moderate"
+        )
+
+        return list(results or [])
+
+    except Exception as error:
+        print(f"Web search error for '{query}': {error}")
+        return []
+
+
+def collect_market_research(niche: str):
+    """
+    Discover affiliate opportunities across multiple
+    product categories using public web search.
+    """
+
+    search_queries = [
+        "best affiliate programs and products 2026",
+        "SaaS software affiliate programs recurring commissions",
+        "physical products ecommerce affiliate programs",
+        "digital products online courses affiliate programs",
+        "AI tools and software affiliate programs",
+        "consumer technology gadgets affiliate programs",
+        "home lifestyle products affiliate programs"
+    ]
+
+    if niche and niche != DEFAULT_NICHE:
+        search_queries.insert(
+            0,
+            f"{niche} products and affiliate programs"
+        )
+
+    collected_results = []
+    seen_urls = set()
+
+    for query in search_queries:
+        results = search_web(query, max_results=4)
+
+        for item in results:
+            url = item.get("href") or item.get("url")
+
+            if not url or url in seen_urls:
+                continue
+
+            seen_urls.add(url)
+
+            collected_results.append({
+                "search_query": query,
+                "title": item.get("title", ""),
+                "url": url,
+                "description": item.get("body", "")
+            })
+
+    return collected_results
+
+
+# ==========================================
+# AI MARKET RESEARCH AGENT
+# ==========================================
+
+def run_market_research(request: ResearchRequest):
+
+    web_results = collect_market_research(request.niche)
+
+    if not web_results:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Web search returned no results. "
+                "Please try again later."
+            )
+        )
+
+    research_data = json.dumps(
+        web_results,
+        ensure_ascii=False,
+        indent=2
+    )
+
+    prompt = f"""
+You are the Market Research Agent of Affiliate Intelligence.
+
+Your mission is to discover promising affiliate business
+opportunities across different product categories.
+
+RESEARCH SCOPE:
+{request.niche}
+
+NUMBER OF OPPORTUNITIES:
+Up to {request.number_of_programs}
+
+LIVE WEB SEARCH RESULTS:
+{research_data}
+
+YOUR TASKS:
+
+1. DISCOVER
+Identify companies, products, services and affiliate
+opportunities appearing in the supplied search results.
+
+2. CLASSIFY
+Classify each opportunity into categories such as:
+- AI tools
+- SaaS and software
+- Physical products
+- Consumer technology
+- Digital products
+- Online education
+- Home and lifestyle
+- Other relevant categories
+
+3. EVALUATE
+Evaluate each opportunity based on:
+- Potential market demand
+- Target audience
+- Product usefulness
+- Competition
+- Marketing difficulty
+- Potential affiliate monetization
+- Possibility of recurring revenue
+- Content creation potential
+- Business risks
+
+4. VERIFY
+Use only the supplied search results as research evidence.
+
+Do not claim that you visited a website.
+Do not claim that an affiliate program is currently open
+unless the supplied evidence explicitly confirms it.
+
+Never invent:
+- Commission percentages
+- Cookie durations
+- Affiliate program terms
+- Product prices
+- Customer numbers
+- Market statistics
+- Sources or URLs
+
+If information is missing, write "Not verified".
+
+5. SCORE
+Give each opportunity a score from 1 to 10.
+
+Explain the reasoning behind every score.
+Scores are preliminary estimates, not measured facts.
+
+6. RANK
+Rank the strongest opportunities.
+
+7. RECOMMEND
+Select the best three opportunities for deeper research.
+
+For every opportunity include:
+- Company
+- Product
+- Category
+- Official website, if present in search results
+- Target audience
+- Evidence found
+- Affiliate program status
+- Commission information, if verified
+- Recurring revenue potential
+- Advantages
+- Disadvantages
+- Marketing potential
+- Risks
+- Opportunity score
+- Sources with URLs
+
+IMPORTANT:
+A search result mentioning a product is not proof
+that its affiliate program exists or is accepting applications.
+
+Separate verified evidence, estimates and unknown information.
+
+Finish with a strategic recommendation explaining
+which opportunities deserve further investigation.
+
+Return a structured professional report.
+"""
+
+    analysis = generate_ai_response(prompt)
+
+    return {
+        "status": "success",
+        "agent": "Market Research Agent",
+        "model": MODEL_NAME,
+        "search_results_found": len(web_results),
+        "live_web_search": True,
+        "research_report": analysis,
+        "source_results": web_results
+    }
+
+
+# ==========================================
+# MAIN ENDPOINTS
+# ==========================================
+
 @app.get("/")
 def home():
     return {
         "status": "online",
-        "project": "AI Affiliate Agency",
-        "version": "4.0.0",
-        "ai_model": MODEL_NAME
+        "project": "Affiliate Intelligence",
+        "version": "5.0.0",
+        "ai_model": MODEL_NAME,
+        "web_research": "enabled"
     }
 
 
@@ -92,9 +324,10 @@ def health():
 
 @app.get("/ai-test")
 def ai_test():
+
     prompt = """
     Introduce yourself as the AI assistant
-    of an AI and SaaS affiliate marketing agency.
+    of Affiliate Intelligence.
 
     Explain your main responsibilities in two short sentences.
     """
@@ -108,68 +341,19 @@ def ai_test():
     }
 
 
+# ==========================================
+# AUTONOMOUS MARKET DISCOVERY
+# ==========================================
+
 @app.post("/research")
 def research(request: ResearchRequest):
 
-    prompt = f"""
-    You are the Affiliate Market Research Analyst
-    of an AI and SaaS affiliate marketing agency.
+    return run_market_research(request)
 
-    Your task is to analyze this niche:
 
-    NICHE: {request.niche}
-
-    Prepare a report covering up to
-    {request.number_of_programs} potential affiliate opportunities.
-
-    For each opportunity analyze:
-
-    1. Company and product name
-    2. Product category
-    3. Official website, if known
-    4. Affiliate program, if known
-    5. Possible commission model
-    6. Recurring commission potential
-    7. Target customers
-    8. Main advantages
-    9. Main disadvantages
-    10. Marketing potential
-
-    IMPORTANT RULES:
-
-    - You do not have live internet search in this version.
-    - Do not claim that you visited or verified websites.
-    - Never invent exact commission percentages.
-    - Never invent cookie durations.
-    - Never claim an affiliate program is currently open
-      unless that information has been verified.
-    - Mark unknown information as "Not verified".
-    - Clearly distinguish facts from estimates.
-    - Do not invent sources or URLs.
-
-    At the end:
-
-    A. Rank the strongest opportunities.
-    B. Explain why they are promising.
-    C. Recommend three products for further verification.
-    D. Explain what information must be checked
-       on each company's official affiliate page.
-
-    Return a clear, professional research report.
-    """
-
-    result = generate_ai_response(prompt)
-
-    return {
-        "status": "success",
-        "agent": "Affiliate Market Researcher",
-        "model": MODEL_NAME,
-        "niche": request.niche,
-        "programs_requested": request.number_of_programs,
-        "live_web_search": False,
-        "report": result
-    }
-
+# ==========================================
+# GENERAL AI ASSISTANT
+# ==========================================
 
 @app.post("/ask-ai")
 def ask_ai(request: AIRequest):
@@ -182,60 +366,56 @@ def ask_ai(request: AIRequest):
         "response": result
     }
 
-class AffiliateAnalysisRequest(BaseModel):
-    company_name: str
-    product_name: str
-    product_description: str = "Not provided"
-    affiliate_details: str = "Not verified"
-    target_audience: str = "Not specified"
 
+# ==========================================
+# AFFILIATE ANALYST
+# ==========================================
 
 @app.post("/analyze-affiliate")
 def analyze_affiliate(request: AffiliateAnalysisRequest):
 
     prompt = f"""
-    You are the Affiliate Program Analyst
-    of a professional AI and SaaS affiliate agency.
+You are the Affiliate Program Analyst of Affiliate Intelligence.
 
-    Analyze the following affiliate opportunity:
+Analyze this opportunity:
 
-    COMPANY: {request.company_name}
-    PRODUCT: {request.product_name}
-    DESCRIPTION: {request.product_description}
-    AFFILIATE DETAILS: {request.affiliate_details}
-    TARGET AUDIENCE: {request.target_audience}
+COMPANY: {request.company_name}
+PRODUCT: {request.product_name}
+DESCRIPTION: {request.product_description}
+AFFILIATE DETAILS: {request.affiliate_details}
+TARGET AUDIENCE: {request.target_audience}
 
-    Analyze these areas:
+Evaluate:
 
-    1. Product value and market demand.
-    2. Target audience and ideal customers.
-    3. Affiliate commission model.
-    4. Recurring revenue potential.
-    5. Cookie duration and program conditions.
-    6. Competition and marketing difficulty.
-    7. Advantages and disadvantages.
-    8. Potential marketing channels.
-    9. Main risks.
-    10. Overall opportunity score from 1 to 10.
+1. Product value and market demand.
+2. Target audience.
+3. Affiliate commission model.
+4. Recurring revenue potential.
+5. Cookie duration and program conditions.
+6. Competition.
+7. Marketing difficulty.
+8. Advantages and disadvantages.
+9. Marketing channels.
+10. Business risks.
+11. Overall opportunity score from 1 to 10.
 
-    IMPORTANT RULES:
+RULES:
 
-    - Do not invent commission percentages.
-    - Do not invent cookie durations.
-    - Do not claim program details are verified.
-    - Mark missing information as "Not verified".
-    - Clearly distinguish facts from estimates.
-    - Do not invent sources or URLs.
-    - Do not promise earnings or guaranteed results.
+- Do not invent commission percentages.
+- Do not invent cookie durations.
+- Do not claim unverified details are facts.
+- Distinguish facts from estimates.
+- Do not promise earnings.
+- Mark missing information as Not verified.
 
-    Finish with:
-    A. Overall assessment.
-    B. Recommendation: High, Medium or Low potential.
-    C. Information that must be verified.
-    D. Recommended next steps.
+Finish with:
+A. Overall assessment.
+B. Recommendation: High, Medium or Low potential.
+C. Information requiring verification.
+D. Recommended next steps.
 
-    Write a structured professional report.
-    """
+Return a structured professional report.
+"""
 
     result = generate_ai_response(prompt)
 
@@ -248,81 +428,69 @@ def analyze_affiliate(request: AffiliateAnalysisRequest):
         "analysis": result
     }
 
+
+# ==========================================
+# FULL RESEARCH AND ANALYSIS WORKFLOW
+# ==========================================
+
 @app.post("/full-workflow")
 def full_workflow(request: ResearchRequest):
 
-    # STEP 1: Research Agent
-    research_prompt = f"""
-    You are the Research Agent of an AI and SaaS affiliate agency.
+    research_result = run_market_research(request)
 
-    Research potential affiliate opportunities in this niche:
-    {request.niche}
-
-    Identify up to {request.number_of_programs} potential products.
-
-    For each product include:
-    - Company name
-    - Product name
-    - Product category
-    - Target audience
-    - Possible affiliate program
-    - Possible commission model
-    - Marketing potential
-
-    IMPORTANT:
-    No live web search is available.
-    Do not invent commission rates or cookie durations.
-    Mark unverified information clearly.
-    Do not invent sources or URLs.
-
-    Return a structured report.
-    """
-
-    research_result = generate_ai_response(research_prompt)
-
-    # STEP 2: Affiliate Analyst
     analysis_prompt = f"""
-    You are the Affiliate Analyst of an AI and SaaS affiliate agency.
+You are the Senior Affiliate Strategy Analyst
+of Affiliate Intelligence.
 
-    Analyze the following research report:
+Review the following live-search-based research report:
 
-    {research_result}
+{research_result["research_report"]}
 
-    Evaluate each identified opportunity based on:
+Your mission is to independently evaluate the
+identified opportunities and create a final shortlist.
 
-    1. Product value
-    2. Target audience
-    3. Market demand
-    4. Affiliate commission potential
-    5. Recurring revenue potential
-    6. Competition
-    7. Marketing difficulty
-    8. Advantages and disadvantages
-    9. Business risks
+Evaluate:
 
-    IMPORTANT:
-    - Do not invent commission rates.
-    - Do not invent cookie durations.
-    - Mark unverified details clearly.
-    - Distinguish facts from estimates.
-    - Do not promise earnings.
+1. Market demand evidence.
+2. Product value.
+3. Target audience.
+4. Affiliate program evidence.
+5. Commission potential.
+6. Recurring revenue potential.
+7. Competition.
+8. Marketing difficulty.
+9. Content creation opportunities.
+10. Business risks.
 
-    Finish with:
-    - Ranked opportunities
-    - Best three opportunities for further verification
-    - Final recommendations
-    - Next steps
+Do not invent facts, commissions, cookie durations,
+sources or URLs.
 
-    Return a professional analysis.
-    """
+Do not treat preliminary opportunity scores
+as verified market data.
 
-    analysis_result = generate_ai_response(analysis_prompt)
+Provide:
+
+- Ranked list of opportunities.
+- Best three opportunities.
+- Reasons for selecting them.
+- Missing information to verify.
+- Recommended marketing channels.
+- Suggested next research actions.
+
+Clearly distinguish evidence from estimates.
+
+Return a professional strategic report.
+"""
+
+    final_analysis = generate_ai_response(analysis_prompt)
 
     return {
         "status": "success",
-        "workflow": "Research to Recommendation",
+        "workflow": "Live Research to Strategic Recommendation",
         "model": MODEL_NAME,
         "niche": request.niche,
-        "research_report": research_result,
-        "final_analysis": analysis_result
+        "search_results_found": research_result["search_results_found"],
+        "research_report": research_result["research_report"],
+        "final_analysis": final_analysis,
+        "source_results": research_result["source_results"]
     }
