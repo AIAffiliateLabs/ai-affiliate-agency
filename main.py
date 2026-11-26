@@ -20,13 +20,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.5: candidate-scoped sentence attribution, expanded source recovery, and evidence-tiered strategy, candidate-specific verification retries, first-party payout context extraction, semantic evidence enforcement, and cross-agent consistency checks.
+# v8.6: official program/application URL extraction, deterministic application and commercial readiness scoring, expanded source recovery, candidate-scoped evidence, semantic enforcement, and cross-agent consistency checks.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="8.5.0"
+    version="8.6.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -548,6 +548,25 @@ def collect_official_site_evidence(search_results):
     compact = []
     for page in inspected:
         item = dict(page)
+        # Retain affiliate/application-related links discovered on the candidate page for traceable URL extraction.
+        base = item.get("final_url") or item.get("requested_url") or ""
+        base_host = urlparse(base).hostname
+        relevant_links = []
+        for href, anchor in item.get("links", []):
+            absolute = urljoin(base, href)
+            label_and_url = f"{anchor} {absolute}".lower()
+            is_http = urlparse(absolute).scheme in ("http", "https")
+            has_program_context = any(term in label_and_url for term in AFFILIATE_TERMS + ("apply", "sign up", "join", "register"))
+            # Retain external application portals only when linked from a candidate-host page
+            # with an explicit affiliate/application cue; never label them as official domains.
+            if is_http and has_program_context:
+                relevant_links.append({
+                    "url": absolute,
+                    "anchor_text": anchor[:180],
+                    "linked_from_candidate_host_url": base,
+                    "link_host_matches_candidate_page": urlparse(absolute).hostname == base_host
+                })
+        item["relevant_program_links"] = relevant_links[:60]
         item.pop("links", None)
         compact.append(item)
 
@@ -740,6 +759,88 @@ def _is_b2b_partner_page(page):
     ))
 
 
+def _unique_nonempty(values):
+    return list(dict.fromkeys(v for v in values if isinstance(v, str) and v.strip()))
+
+
+def _is_application_url(url, anchor=""):
+    value = f"{url} {anchor}".lower()
+    return any(term in value for term in (
+        "apply", "application", "signup", "sign-up", "register",
+        "join", "impact.com", "partnerstack", "cj.com", "awin.com",
+        "shareasale", "rakutenadvertising", "avantlink"
+    ))
+
+
+def build_readiness_assessment(record):
+    """Transparent deterministic readiness scores; not a prediction of approval or earnings."""
+    status = record.get("verification_status", "")
+    program_found = status == "Candidate-host affiliate/referral page inspected — program evidence found"
+    discontinued = status == "Program discontinued — do not promote"
+    direct_urls = record.get("official_program_urls", [])
+    commission_known = record.get("commission") not in (None, "", "Not verified")
+    cookie_known = record.get("cookie_duration") not in (None, "", "Not verified")
+    eligibility_known = record.get("eligibility") not in (None, "", "Not verified")
+    payout_known = record.get("payout_threshold") not in (None, "", "Not verified")
+    application_text = record.get("application_status", "Not verified").lower()
+    application_observed = any(x in application_text for x in ("application link", "apply", "sign up", "invitation"))
+    ownership_authenticated = record.get("official_domain_confidence") == "Authenticated"
+
+    # 100-point application readiness: evidence and actionable application route first,
+    # then commercial terms and eligibility. Unknown fields score zero, never assumed.
+    components = {
+        "publisher_program_evidence": 25 if program_found else 0,
+        "direct_program_url": 15 if direct_urls else 0,
+        "commission_terms": 15 if commission_known else 0,
+        "cookie_terms": 10 if cookie_known else 0,
+        "geographic_eligibility": 10 if eligibility_known else 0,
+        "payout_threshold": 10 if payout_known else 0,
+        "application_route": 10 if application_observed else 0,
+        "domain_ownership": 5 if ownership_authenticated else 0
+    }
+    application_score = 0 if (discontinued or not program_found) else sum(components.values())
+
+    commercial_components = {
+        "commission_terms": 35 if commission_known else 0,
+        "cookie_terms": 20 if cookie_known else 0,
+        "geographic_eligibility": 20 if eligibility_known else 0,
+        "payout_threshold": 15 if payout_known else 0,
+        "application_route": 10 if application_observed else 0
+    }
+    commercial_score = 0 if (discontinued or not program_found) else sum(commercial_components.values())
+
+    if discontinued:
+        label = "Disqualified — program discontinued"
+    elif not program_found:
+        label = "Research only — publisher program not established"
+    elif application_score >= 80:
+        label = "High readiness — manual confirmation still required"
+    elif application_score >= 55:
+        label = "Moderate readiness — resolve remaining unknowns"
+    else:
+        label = "Early lead — further verification required"
+
+    missing = []
+    for field, known in (
+        ("commission", commission_known), ("cookie_duration", cookie_known),
+        ("eligibility", eligibility_known), ("payout_threshold", payout_known),
+        ("application route", bool(direct_urls) or application_observed),
+        ("legal domain ownership", ownership_authenticated)
+    ):
+        if not known:
+            missing.append(field)
+
+    return {
+        "application_readiness_score": application_score,
+        "commercial_readiness_score": commercial_score,
+        "readiness_label": label,
+        "score_components": components,
+        "commercial_score_components": commercial_components,
+        "missing_items": missing,
+        "interpretation": "Deterministic evidence-completeness score only. It is not an approval probability, revenue forecast, or guarantee that applications are open. Unknown fields score zero and are not inferred."
+    }
+
+
 def build_structured_evidence_records(
     discovered_candidates,
     candidate_searches,
@@ -907,7 +1008,21 @@ def build_structured_evidence_records(
         else:
             program_type = "Unclear / no publisher affiliate program established"
 
-        records.append({
+        relevant_links = []
+        for page in publisher_pages:
+            for link in page.get("relevant_program_links", []):
+                relevant_links.append(link)
+        official_program_urls = _unique_nonempty([
+            p.get("final_url") or p.get("requested_url") for p in publisher_pages
+        ])
+        # Prefer an explicit affiliate/referral URL over a generic home page.
+        official_program_urls.sort(key=lambda u: (0 if re.search(r"(?i)(affiliate|referral|publisher|partner-program|creator)", urlparse(u).path) else 1, len(u)))
+        application_urls = _unique_nonempty([
+            link.get("url") for link in relevant_links
+            if _is_application_url(link.get("url", ""), link.get("anchor_text", ""))
+        ])
+
+        record = {
             "candidate": name,
             "category": candidate.get("category", "Not stated"),
             "discovery_rank": candidate.get("rank"),
@@ -924,6 +1039,13 @@ def build_structured_evidence_records(
                 if p.get("final_url") or p.get("requested_url")
             )),
             "affiliate_evidence_urls": evidence_urls,
+            "official_program_urls": official_program_urls,
+            "application_urls": application_urls,
+            "application_url_provenance": [
+                {"url": link.get("url"), "linked_from_candidate_host_url": link.get("linked_from_candidate_host_url"),
+                 "link_host_matches_candidate_page": link.get("link_host_matches_candidate_page")}
+                for link in relevant_links if link.get("url") in application_urls
+            ],
             "verification_status": status,
             "program_status": status,
             "application_status": application_status,
@@ -944,7 +1066,9 @@ def build_structured_evidence_records(
                 "Third-party commission and cookie claims are not accepted as verified terms.",
                 "Eligibility, geography and payout details require direct confirmation unless explicitly shown on a qualifying candidate-host page."
             ]
-        })
+        }
+        record["readiness"] = build_readiness_assessment(record)
+        records.append(record)
 
     return records
 
@@ -1030,9 +1154,9 @@ def _line_has_unsupported_term_claim(line, candidate):
 def _normalize_report_version(report_text):
     """Replace stale self-reported platform versions in generated agent prose."""
     text = str(report_text or "")
-    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-4](?:\.0)?", r"\g<1>8.5.0", text)
-    text = re.sub(r"(?i)(\bversion\s+)8\.[0-4](?:\.0)?", r"\g<1>8.5.0", text)
-    text = re.sub(r"(?i)(\bv)8\.[0-4](?:\.0)?\b", r"\g<1>8.5.0", text)
+    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-5](?:\.0)?", r"\g<1>8.6.0", text)
+    text = re.sub(r"(?i)(\bversion\s+)8\.[0-5](?:\.0)?", r"\g<1>8.6.0", text)
+    text = re.sub(r"(?i)(\bv)8\.[0-5](?:\.0)?\b", r"\g<1>8.6.0", text)
     return text
 
 
@@ -1136,7 +1260,7 @@ def _candidate_claim_sentences(report_text, candidate_name):
 
 
 def _candidate_claim_lines(report_text, candidate_name):
-    """Backward-compatible alias; attribution is sentence-scoped in v8.5."""
+    """Backward-compatible alias; attribution is sentence-scoped in v8.6."""
     return _candidate_claim_sentences(report_text, candidate_name)
 
 
@@ -1247,12 +1371,12 @@ def build_agent_consistency_audit(records, agent_reports):
 def build_report_metadata(agent_reports):
     """Report stale agent version labels without silently treating them as evidence issues."""
     stale = []
-    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-4](?:\.0)?\b")
+    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-5](?:\.0)?\b")
     for agent_name, report in (agent_reports or {}).items():
         if version_pattern.search(str(report or "")):
             stale.append(agent_name)
     return {
-        "application_version": "8.5.0",
+        "application_version": "8.6.0",
         "agent_reports_with_stale_version_labels": stale,
         "status": "passed" if not stale else "review_required",
         "version_policy": "All agent prompts and generated report version labels must match the running application version."
@@ -1311,7 +1435,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 8.5.
+You are the Market Discovery Agent of Affiliate Intelligence, version 8.6.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1436,7 +1560,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 8.5.
+You are the Verification Agent of Affiliate Intelligence, version 8.6.
 
 V8 STRICT EVIDENCE RULES:
 - The structured ledger is deterministic and authoritative; do not upgrade it.
@@ -1772,6 +1896,12 @@ FINAL DATA INTEGRITY CONTRACT:
 - Never reuse another brand's commission, cookie, payout or eligibility terms.
 - A third-party domain or generic product page cannot establish an affiliate program or its terms.
 - Copy exact verification_status and application_status from the ledger.
+- Use the deterministic readiness scores in each ledger record. Explain that they
+  measure evidence completeness only, not approval probability or earnings.
+- Separate Application Readiness from Commercial Readiness. Do not rank a high
+  application-readiness score as proof of profitable economics.
+- Prefer exact official_program_urls and application_urls from the ledger; never
+  invent or reconstruct a signup URL. If none is present, say so.
 - A discontinued program is disqualified: never rank it, recommend it, or describe
   it as a viable monetization opportunity.
 - Do not call a candidate fully verified unless official domain ownership and
@@ -1873,6 +2003,10 @@ E. NEXT ACTIONS
 Provide a practical action plan for further research.
 
 F. STRATEGIC CONCLUSION
+
+Include a compact Application Readiness and Commercial Readiness table for each
+candidate with ledger scores, labels, direct official program URLs, application
+URLs when available, and missing items. Scores are evidence-completeness measures.
 
 Recommend which opportunities should receive
 the next round of investigation.
@@ -2003,7 +2137,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.5.0",
+            "version": "8.6.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2020,6 +2154,12 @@ def run_agent_workflow(request: ResearchRequest):
             "candidate_searches": candidate_searches if "candidate_searches" in locals() else [],
             "official_site_evidence": official_site_evidence,
             "structured_evidence_records": structured_evidence_records,
+            "readiness_summary": [
+                {"candidate": item.get("candidate"), "verification_status": item.get("verification_status"),
+                 "official_program_urls": item.get("official_program_urls", []),
+                 "application_urls": item.get("application_urls", []), **item.get("readiness", {})}
+                for item in structured_evidence_records
+            ],
             "evidence_enforcement": {"status": "partial_not_finalized", "note": "Workflow stopped before all agents completed."},
             "agent_consistency_audit": build_agent_consistency_audit(
                 structured_evidence_records,
@@ -2036,7 +2176,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.5.0",
+            "version": "8.6.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2053,6 +2193,12 @@ def run_agent_workflow(request: ResearchRequest):
             "candidate_searches": candidate_searches if "candidate_searches" in locals() else [],
             "official_site_evidence": official_site_evidence,
             "structured_evidence_records": structured_evidence_records,
+            "readiness_summary": [
+                {"candidate": item.get("candidate"), "verification_status": item.get("verification_status"),
+                 "official_program_urls": item.get("official_program_urls", []),
+                 "application_urls": item.get("application_urls", []), **item.get("readiness", {})}
+                for item in structured_evidence_records
+            ],
             "evidence_enforcement": {"status": "partial_not_finalized", "note": "Workflow stopped before all agents completed."},
             "agent_consistency_audit": build_agent_consistency_audit(
                 structured_evidence_records,
@@ -2091,7 +2237,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "8.5.0",
+        "version": "8.6.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2117,7 +2263,17 @@ def run_agent_workflow(request: ResearchRequest):
             "note": "Retries improve source discovery but search results remain leads, not verification."
         },
         "official_site_evidence": official_site_evidence,
-        "structured_evidence_records": structured_evidence_records
+        "structured_evidence_records": structured_evidence_records,
+        "readiness_summary": [
+            {
+                "candidate": item.get("candidate"),
+                "verification_status": item.get("verification_status"),
+                "official_program_urls": item.get("official_program_urls", []),
+                "application_urls": item.get("application_urls", []),
+                **item.get("readiness", {})
+            }
+            for item in structured_evidence_records
+        ]
     }
 
 
@@ -2130,7 +2286,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "8.5.0",
+        "version": "8.6.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
