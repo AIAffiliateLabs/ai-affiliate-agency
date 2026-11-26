@@ -25,7 +25,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="7.6.0"
+    version="7.7.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -582,6 +582,296 @@ def collect_market_page_evidence(search_results, max_pages: int = 14):
     }
 
 
+
+
+# ==========================================
+# STRUCTURED EVIDENCE RECORDS — v7.7
+# ==========================================
+
+def _host(url):
+    try:
+        return (urlparse(url).hostname or "").lower().removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def _candidate_key(name):
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _page_text(page):
+    return " ".join([
+        page.get("title", ""),
+        page.get("description", ""),
+        page.get("text_excerpt", "")
+    ]).lower()
+
+
+def _candidate_page_match(candidate_name, page):
+    """Conservative association: candidate metadata must match, then host/title evidence."""
+    if page.get("candidate", "").strip().lower() != candidate_name.strip().lower():
+        return False
+    key = _candidate_key(candidate_name)
+    host = _candidate_key(_host(page.get("final_url") or page.get("requested_url", "")))
+    title = _candidate_key(page.get("title", ""))
+    # Require a recognizable brand token in either host or page title.
+    return bool(key and (key in host or key in title))
+
+
+def _extract_explicit_terms(text):
+    """Extract only obvious numeric terms from the inspected page text; never infer."""
+    commission = "Not verified"
+    cookie = "Not verified"
+
+    commission_patterns = [
+        r"(?:commission|commissions|referral fee|payout)[^.%$]{0,45}(\d{1,3}(?:\.\d{1,2})?\s*%)",
+        r"(\d{1,3}(?:\.\d{1,2})?\s*%)[^.\n]{0,45}(?:commission|referral|sale)"
+    ]
+    for pattern in commission_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            commission = match.group(1).strip()
+            break
+
+    cookie_patterns = [
+        r"cookie(?:\s+duration|\s+window)?\s*(?:is|of|:)?\s*(\d{1,4}\s*(?:days?|weeks?|months?))",
+        r"(\d{1,4}\s*(?:days?|weeks?|months?))[^.\n]{0,35}cookie"
+    ]
+    for pattern in cookie_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            cookie = re.sub(r"\s+", " ", match.group(1)).strip()
+            break
+
+    return commission, cookie
+
+
+def build_structured_evidence_records(
+    discovered_candidates,
+    candidate_searches,
+    official_site_evidence
+):
+    """
+    Build deterministic, auditable per-candidate records from the actual fetched
+    pages. Search snippets alone never establish official verification.
+    """
+    pages = (official_site_evidence or {}).get("pages", [])
+    search_by_candidate = {
+        item.get("candidate", "").strip().lower(): item
+        for item in (candidate_searches or [])
+    }
+    checked_at = (official_site_evidence or {}).get(
+        "checked_at_utc", datetime.now(timezone.utc).isoformat()
+    )
+    records = []
+
+    for candidate in discovered_candidates or []:
+        name = candidate.get("candidate", "")
+        search_item = search_by_candidate.get(name.strip().lower(), {})
+        search_results = search_item.get("results", [])
+        matched_pages = [
+            page for page in pages
+            if page.get("candidate", "").strip().lower() == name.strip().lower()
+            and page.get("status") == "inspected"
+        ]
+
+        candidate_pages = [
+            page for page in matched_pages
+            if _candidate_page_match(name, page)
+        ]
+
+        # Affiliate-related pages must be on the same host as a candidate-matched
+        # page and contain explicit affiliate/partner program language.
+        matched_hosts = {
+            _host(page.get("final_url") or page.get("requested_url", ""))
+            for page in candidate_pages
+        }
+        program_pages = []
+        for page in candidate_pages:
+            text_content = _page_text(page)
+            url_text = (page.get("final_url") or page.get("requested_url", "")).lower()
+            has_program_language = any(term in text_content or term in url_text for term in (
+                "affiliate program", "affiliate-partner", "affiliate partner",
+                "partner program", "referral program", "creator program",
+                "become an affiliate", "join our affiliate"
+            ))
+            if has_program_language:
+                program_pages.append(page)
+
+        # A closure status is assigned only when an inspected, candidate-matched
+        # page contains explicit discontinuation language tied to an affiliate/
+        # partner/referral program. A third-party snippet is never sufficient.
+        discontinued_phrases = (
+            "affiliate program has been discontinued",
+            "affiliate programme has been discontinued",
+            "affiliate program is discontinued",
+            "affiliate program has ended",
+            "affiliate program is no longer available",
+            "affiliate program will be discontinued",
+            "we have discontinued our affiliate",
+            "discontinuing our affiliate program",
+            "program has been discontinued",
+            "programme has been discontinued",
+        )
+        discontinued_evidence = []
+        for page in candidate_pages:
+            page_text = _page_text(page)
+            if any(phrase in page_text for phrase in discontinued_phrases):
+                discontinued_evidence.append(page)
+
+        if discontinued_evidence:
+            status = "Program discontinued — do not promote"
+            confidence = "Medium — explicit closure language on candidate-matched page; domain ownership still not independently authenticated"
+        elif program_pages:
+            status = "Candidate-matched affiliate/partner page inspected — program evidence found"
+            confidence = "Medium — candidate/domain text match; ownership not independently authenticated"
+        elif candidate_pages:
+            status = "Candidate-matched website inspected — program not found in inspected pages"
+            confidence = "Low to Medium — candidate/domain text match only"
+        elif search_results:
+            status = "Third-party evidence only"
+            confidence = "Low — no candidate-matched official page inspected"
+        else:
+            status = "Not verified"
+            confidence = "Unknown"
+
+        # "Page inspected" does not mean applications are open. Only explicit
+        # application-intake language on the inspected candidate-matched page
+        # can support an accepting-applications status.
+        application_status = "Not verified"
+        application_phrases = (
+            "apply now", "apply to become an affiliate", "join our affiliate program",
+            "sign up as an affiliate", "become an affiliate", "affiliate application",
+            "partner application", "join the partner program"
+        )
+        if status == "Program discontinued — do not promote":
+            application_status = "Closed — explicit discontinuation evidence"
+        elif any(any(phrase in _page_text(page) for phrase in application_phrases)
+                 for page in program_pages):
+            application_status = "Application link/invitation observed; acceptance not confirmed"
+        elif program_pages:
+            application_status = "Program described; application status unclear"
+
+        evidence_urls = []
+        for page in (discontinued_evidence or program_pages or candidate_pages):
+            url = page.get("final_url") or page.get("requested_url")
+            if url and url not in evidence_urls:
+                evidence_urls.append(url)
+
+        # Keep the official URL unset unless the domain match is sufficiently clear.
+        official_url = None
+        if candidate_pages:
+            official_url = candidate_pages[0].get("final_url") or candidate_pages[0].get("requested_url")
+
+        commission = "Not verified"
+        cookie_duration = "Not verified"
+        term_evidence = []
+        for page in program_pages:
+            text_content = _page_text(page)
+            page_commission, page_cookie = _extract_explicit_terms(text_content)
+            if page_commission != "Not verified":
+                commission = page_commission
+                term_evidence.append({
+                    "term": "commission",
+                    "value": page_commission,
+                    "evidence_url": page.get("final_url") or page.get("requested_url"),
+                    "excerpt": text_content[:700]
+                })
+            if page_cookie != "Not verified":
+                cookie_duration = page_cookie
+                term_evidence.append({
+                    "term": "cookie_duration",
+                    "value": page_cookie,
+                    "evidence_url": page.get("final_url") or page.get("requested_url"),
+                    "excerpt": text_content[:700]
+                })
+
+        records.append({
+            "candidate": name,
+            "category": candidate.get("category", "Not stated"),
+            "discovery_rank": candidate.get("rank"),
+            # This is a candidate URL, not a claim of authenticated ownership.
+            "official_url_candidate": official_url or "Not identified",
+            "official_domain_confidence": "Not authenticated",
+            "official_domain_match_confidence": confidence,
+            "discovery_source_urls": list(dict.fromkeys(
+                [item.get("url") for item in search_results if item.get("url")]
+            )),
+            "candidate_search_urls": list(dict.fromkeys(
+                [item.get("url") for item in search_results if item.get("url")]
+            )),
+            "inspected_page_urls": list(dict.fromkeys(
+                [page.get("final_url") or page.get("requested_url") for page in matched_pages
+                 if page.get("final_url") or page.get("requested_url")]
+            )),
+            "affiliate_evidence_urls": evidence_urls,
+            "verification_status": status,
+            "program_status": status,
+            "application_status": application_status,
+            "commission": commission,
+            "cookie_duration": cookie_duration,
+            "eligibility": "Not verified",
+            "payout_threshold": "Not verified",
+            "last_checked_utc": checked_at,
+            "confidence": confidence,
+            "term_evidence": term_evidence,
+            "unknowns": [
+                "Legal ownership of the candidate domain is not independently authenticated.",
+                "A program page does not prove applications are currently being accepted.",
+                "Eligibility, geography and payout details require direct confirmation unless explicitly shown in the cited page."
+            ]
+        })
+
+    return records
+
+
+def build_agent_consistency_audit(records, agent_reports):
+    """
+    Deterministic guardrail audit. It does not rewrite model reports; it flags
+    report text that conflicts with the evidence ledger.
+    """
+    findings = []
+    for record in records or []:
+        name = record.get("candidate", "")
+        status = record.get("verification_status", record.get("program_status", "Not verified"))
+        closed = status == "Program discontinued — do not promote"
+        unsupported = status in ("Third-party evidence only", "Not verified")
+        for agent_name, report in (agent_reports or {}).items():
+            report_text = str(report or "")
+            # Only flag explicit strong claims; generic discussion is not enough.
+            patterns = [
+                rf"(?is)\b{re.escape(name)}\b.{{0,180}}\b(?:fully verified|verified active|actively accepting applications|open for applications)\b",
+                rf"(?is)\b(?:fully verified|verified active|actively accepting applications|open for applications)\b.{{0,180}}\b{re.escape(name)}\b",
+            ]
+            if closed:
+                patterns += [
+                    rf"(?is)\b{re.escape(name)}\b.{{0,180}}\b(?:active program|active affiliate|promote|recommended|top recommendation)\b",
+                    rf"(?is)\b(?:active program|active affiliate|top recommendation)\b.{{0,180}}\b{re.escape(name)}\b",
+                ]
+            if unsupported:
+                patterns += [
+                    rf"(?is)\b{re.escape(name)}\b.{{0,180}}\b(?:verified program|verified commission|verified cookie)\b",
+                    rf"(?is)\b(?:verified program|verified commission|verified cookie)\b.{{0,180}}\b{re.escape(name)}\b",
+                ]
+            if any(re.search(pattern, report_text) for pattern in patterns):
+                findings.append({
+                    "candidate": name,
+                    "agent": agent_name,
+                    "ledger_status": status,
+                    "issue": "Potential report/ledger inconsistency — manual review required"
+                })
+    return {
+        "status": "review_required" if findings else "no_conflicts_detected_by_rules",
+        "checks_run": len(records or []) * len(agent_reports or {}),
+        "findings": findings,
+        "note": "Automated text checks are conservative and may miss paraphrased conflicts; absence of findings is not proof of correctness."
+    }
+
+
+def _records_json(records):
+    return json.dumps(records or [], ensure_ascii=False, indent=2)
+
+
 # ==========================================
 # AGENT 1 — MARKET DISCOVERY
 # ==========================================
@@ -631,7 +921,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 7.6.
+You are the Market Discovery Agent of Affiliate Intelligence, version 7.7.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -745,403 +1035,293 @@ Return a structured, concise but sufficiently detailed professional report.
     return generate_ai_response(prompt)
 
 
-
-# ==========================================
-# STRUCTURED EVIDENCE RECORDS
-# ==========================================
-
-VERIFICATION_STATUSES = {
-    "official_affiliate_page_inspected_program_evidence_found",
-    "official_website_inspected_affiliate_program_not_found",
-    "third_party_evidence_only",
-    "not_verified",
-    "conflicting_evidence",
-}
-
-def build_candidate_evidence_inputs(candidates, candidate_searches, official_site_evidence):
-    """Create deterministic, candidate-scoped evidence bundles from fetched sources."""
-    pages = (official_site_evidence or {}).get("pages", [])
-    search_by_name = {
-        item.get("candidate", "").strip().lower(): item
-        for item in (candidate_searches or [])
-    }
-    bundles = []
-
-    for candidate in candidates:
-        name = candidate.get("candidate", "")
-        search_item = search_by_name.get(name.strip().lower(), {})
-        search_results = search_item.get("results", [])
-        candidate_pages = [
-            page for page in pages
-            if page.get("candidate", "").strip().lower() == name.strip().lower()
-        ]
-
-        evidence_items = []
-        for result in search_results:
-            evidence_items.append({
-                "source_kind": "search_result_unverified",
-                "title": result.get("title", ""),
-                "url": result.get("url", ""),
-                "snippet": result.get("description", "")[:1200],
-                "page_inspected": False,
-            })
-
-        for page in candidate_pages:
-            evidence_items.append({
-                "source_kind": "fetched_public_page",
-                "requested_url": page.get("requested_url", ""),
-                "final_url": page.get("final_url", ""),
-                "fetch_status": page.get("status", "unknown"),
-                "page_title": page.get("title", ""),
-                "page_description": page.get("description", ""),
-                "text_excerpt": page.get("text_excerpt", "")[:5000],
-                "fetch_reason": page.get("reason", ""),
-                "page_inspected": page.get("status") == "inspected",
-            })
-
-        bundles.append({
-            "candidate": name,
-            "category": candidate.get("category", "Not stated"),
-            "discovery_rank": candidate.get("rank"),
-            "evidence_items": evidence_items,
-        })
-
-    return bundles
-
-
-def _extract_json_payload(text_value):
-    """Parse a JSON object/array from a model response, including fenced JSON."""
-    cleaned = (text_value or "").strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        pass
-
-    start_obj = cleaned.find("{")
-    start_arr = cleaned.find("[")
-    starts = [p for p in (start_obj, start_arr) if p >= 0]
-    if not starts:
-        raise ValueError("No JSON payload found in verification response.")
-    start = min(starts)
-    decoder = json.JSONDecoder()
-    payload, _ = decoder.raw_decode(cleaned[start:])
-    return payload
-
-
-def _candidate_allowed_urls(bundle):
-    allowed = set()
-    for item in bundle.get("evidence_items", []):
-        for key in ("url", "requested_url", "final_url"):
-            value = item.get(key)
-            if value:
-                allowed.add(value)
-    return allowed
-
-
-def validate_structured_evidence_records(raw_records, evidence_bundles, checked_at):
-    """
-    Validate model output against actual candidate-scoped source URLs.
-    Unsupported URLs/terms are downgraded rather than treated as verified.
-    """
-    if isinstance(raw_records, dict):
-        raw_records = raw_records.get("records", [])
-    if not isinstance(raw_records, list):
-        raw_records = []
-
-    raw_by_name = {
-        str(item.get("candidate", "")).strip().lower(): item
-        for item in raw_records if isinstance(item, dict)
-    }
-
-    validated = []
-    for bundle in evidence_bundles:
-        name = bundle["candidate"]
-        raw = raw_by_name.get(name.strip().lower(), {})
-        allowed_urls = _candidate_allowed_urls(bundle)
-        inspected_urls = {
-            item.get("final_url") or item.get("requested_url")
-            for item in bundle.get("evidence_items", [])
-            if item.get("source_kind") == "fetched_public_page"
-            and item.get("page_inspected")
-        }
-        search_urls = {
-            item.get("url") for item in bundle.get("evidence_items", [])
-            if item.get("source_kind") == "search_result_unverified"
-        }
-
-        official_url = raw.get("official_website_url")
-        affiliate_url = raw.get("official_affiliate_page_url")
-        commission_source = raw.get("commission_source_url")
-        cookie_source = raw.get("cookie_duration_source_url")
-
-        # A model-supplied URL is retained only if this workflow actually found it.
-        if official_url not in inspected_urls:
-            official_url = None
-        if affiliate_url not in inspected_urls:
-            affiliate_url = None
-        if commission_source not in inspected_urls:
-            commission_source = None
-        if cookie_source not in inspected_urls:
-            cookie_source = None
-
-        status = raw.get("verification_status")
-        if status not in VERIFICATION_STATUSES:
-            status = "not_verified"
-
-        # Official-page inspection is not enough to verify a term: each term
-        # must cite a candidate-specific page that this system actually fetched.
-        commission = raw.get("commission")
-        if not commission_source:
-            commission = "Not verified"
-        cookie_duration = raw.get("cookie_duration")
-        if not cookie_source:
-            cookie_duration = "Not verified"
-
-        evidence_urls = []
-        for value in raw.get("evidence_urls", []) if isinstance(raw.get("evidence_urls", []), list) else []:
-            if value in allowed_urls and value not in evidence_urls:
-                evidence_urls.append(value)
-
-        # Conservative status corrections based on observable fetch coverage.
-        if affiliate_url and status != "conflicting_evidence":
-            status = "official_affiliate_page_inspected_program_evidence_found"
-        elif inspected_urls and status not in {"conflicting_evidence"}:
-            status = "official_website_inspected_affiliate_program_not_found"
-        elif search_urls and status not in {"conflicting_evidence"}:
-            status = "third_party_evidence_only"
-        elif status != "conflicting_evidence":
-            status = "not_verified"
-
-        confidence = raw.get("confidence")
-        if confidence not in {"high", "medium", "low", "unknown"}:
-            confidence = "unknown"
-        if status in {"third_party_evidence_only", "not_verified"}:
-            confidence = "low" if search_urls else "unknown"
-
-        validated.append({
-            "candidate": name,
-            "category": bundle.get("category", "Not stated"),
-            "discovery_rank": bundle.get("discovery_rank"),
-            "official_website_url": official_url,
-            "official_affiliate_page_url": affiliate_url,
-            "official_domain_confidence": confidence,
-            "verification_status": status,
-            "application_status": raw.get("application_status", "Unknown / not verified"),
-            "commission": commission if commission is not None else "Not verified",
-            "commission_source_url": commission_source,
-            "cookie_duration": cookie_duration if cookie_duration is not None else "Not verified",
-            "cookie_duration_source_url": cookie_source,
-            "affiliate_program_evidence_found": bool(affiliate_url),
-            "program_terms_verified": bool(commission_source or cookie_source),
-            "evidence_urls": evidence_urls,
-            "evidence_summary": str(raw.get("evidence_summary", ""))[:1200],
-            "unknowns": raw.get("unknowns", []) if isinstance(raw.get("unknowns", []), list) else [],
-            "last_checked_utc": checked_at,
-            "confidence_note": (
-                "Confidence applies to the evidence classification, not to earnings "
-                "or the likelihood of approval."
-            ),
-            "source_coverage": {
-                "search_results_found": len(search_urls),
-                "public_pages_inspected": len(inspected_urls),
-                "inspected_page_urls": sorted(inspected_urls),
-            },
-        })
-
-    return validated
-
-
 # ==========================================
 # AGENT 2 — VERIFICATION
 # ==========================================
 
-def run_verification_agent(evidence_bundles, checked_at):
-    """Return candidate-level structured evidence records and a readable report."""
-    evidence_data = json.dumps(evidence_bundles, ensure_ascii=False, indent=2)
+def run_verification_agent(discovery_report, candidate_searches, official_site_evidence, structured_evidence_records):
+    """Verify each candidate against its own targeted search and inspected pages."""
+    research_data = json.dumps(candidate_searches, ensure_ascii=False, indent=2)
+    inspected_data = json.dumps(official_site_evidence, ensure_ascii=False, indent=2)
+    structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 7.6.
+You are the Verification Agent of Affiliate Intelligence, version 7.7.
 
-DATE CHECKED (UTC): {checked_at}
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
-TASK:
-For every candidate in the supplied evidence bundles, return exactly one JSON
-record. Use ONLY the evidence supplied for that same candidate.
+MISSION:
+Audit each company/product candidate from Market Discovery. Your job is to
+verify whether that specific company has an affiliate, referral, partner,
+creator or publisher program, using candidate-specific evidence.
 
-Return valid JSON only, with this exact top-level shape:
-{{
-  "records": [
-    {{
-      "candidate": "exact candidate name",
-      "official_website_url": "exact URL from supplied evidence or null",
-      "official_affiliate_page_url": "exact URL of an inspected official affiliate page or null",
-      "official_domain_confidence": "high|medium|low|unknown",
-      "verification_status": "official_affiliate_page_inspected_program_evidence_found|official_website_inspected_affiliate_program_not_found|third_party_evidence_only|not_verified|conflicting_evidence",
-      "application_status": "exactly stated status or Unknown / not verified",
-      "commission": "exactly stated term or Not verified",
-      "commission_source_url": "exact inspected source URL or null",
-      "cookie_duration": "exactly stated term or Not verified",
-      "cookie_duration_source_url": "exact inspected source URL or null",
-      "evidence_urls": ["exact supplied URLs only"],
-      "evidence_summary": "short factual explanation",
-      "unknowns": ["unknown items"]
-    }}
-  ]
-}}
+DISCOVERY REPORT:
+{discovery_report}
 
-EVIDENCE BUNDLES:
-{evidence_data}
+CANDIDATE-SPECIFIC SEARCH RESULTS:
+{research_data}
 
-STRICT RULES:
-- Include every candidate exactly once. Never add a candidate.
-- Use exact source URLs from that candidate's evidence bundle only.
-- A search result or third-party listing is not official verification.
-- A fetched page is not automatically official. If domain ownership is uncertain,
-  set confidence to low or unknown and do not call it an official affiliate page.
-- An official website page that does not mention an affiliate program does not
-  prove no program exists. Use the status "official_website_inspected_affiliate_program_not_found".
-- Use "official_affiliate_page_inspected_program_evidence_found" only when an
-  inspected page is demonstrably on the candidate's official domain AND itself
-  contains affiliate/partner program evidence.
-- A portal sign-in page, generic partner portal, or page that merely links to a
-  program is not proof of commission terms or open applications.
-- Commission and cookie duration must be exact text explicitly present on an
-  inspected official page. If absent, use "Not verified" and null source URL.
-- Never infer a commission, cookie, payout, geography, eligibility, approval
-  requirement, program status or application availability.
-- If a fetched page belongs to another company or a third-party network, do not
-  attribute its terms to this candidate.
-- Do not use general knowledge to fill gaps.
-- If sources conflict, use "conflicting_evidence" and explain the conflict.
-- Do not output markdown fences or commentary. JSON only.
+PUBLIC PAGES ACTUALLY FETCHED BY THIS SYSTEM:
+{inspected_data}
+
+DETERMINISTIC STRUCTURED EVIDENCE RECORDS (SOURCE OF TRUTH):
+{structured_data}
+
+STRUCTURED RECORD RULES:
+- Treat each structured record as the authoritative machine-generated evidence ledger.
+- Repeat its candidate, URLs, status, commission and cookie fields exactly.
+- You may explain evidence, but MUST NOT upgrade the record status or fill missing values.
+- "Official URL candidate" is a candidate match, not independently authenticated ownership.
+- Copy verification_status, program_status, application_status, official_domain_confidence,
+  commission and cookie_duration exactly from the structured record.
+- Never set application_status to "Open" merely because a page was inspected.
+- If a record says terms are Not verified, keep them Not verified even if you know them from memory.
+
+IMPORTANT MATCHING RULE:
+- Keep evidence attached to the exact candidate named in each search result/page.
+- Do not use a different company's page as proof for this candidate.
+- A marketplace/network directory or blog article is third-party evidence,
+  not the candidate's official affiliate program page.
+- A page is not official merely because it mentions the company. Assess the
+  domain and page ownership from the evidence; if uncertain, say so.
+- If the candidate is an affiliate software/network platform (for example,
+  software used by merchants to run affiliate programs), distinguish it from
+  a brand/product that publishers can themselves promote. Do not assume it
+  has a publisher-facing affiliate program.
+
+FOR EACH DISCOVERED CANDIDATE, REPORT:
+1. Candidate company/product and category.
+2. Candidate's likely official domain, only when supported by evidence.
+3. Official-domain confidence: High / Medium / Low / Unknown, with reason.
+4. Official affiliate/partner page URL, only if it appears in inspected evidence.
+5. Whether that page was directly inspected by this system.
+6. Program status: explicitly accepting applications / program described but
+   application status unclear / not found in inspected pages / unknown.
+7. Commission amount/model, only if explicitly stated on a reliable source.
+8. Cookie duration, only if explicitly stated.
+9. Eligibility, geography, payout threshold and restrictions, only if stated.
+10. Short evidence excerpts and their exact source URLs.
+11. Unknowns, contradictions and recommended next verification step.
+
+USE EXACTLY ONE VERIFICATION STATUS PER CANDIDATE:
+- Official affiliate page inspected — program evidence found
+- Official website inspected — affiliate program not found in inspected pages
+- Third-party evidence only
+- Not verified
+- Conflicting evidence
+
+EVIDENCE RULES:
+- Search snippets and third-party roundups are leads, not direct verification.
+- A fetched page is not automatically official; explain why you consider it
+  official or why ownership remains uncertain.
+- Do not claim a program is active or accepting applications unless the
+  inspected official page explicitly supports that conclusion.
+- Do not infer commissions, cookie durations, payouts, eligibility or terms.
+- If a value is absent, write "Not stated on inspected pages".
+- If fetching failed, say "Page could not be inspected" and include the reason
+  when available.
+- "Not found in inspected pages" does not mean the program does not exist.
+- Never invent URLs, quotes, dates, program status or facts.
+- Clearly separate directly observed facts, third-party claims and analysis.
+
+OUTPUT:
+A. Executive summary of verification coverage.
+B. One verification profile for EVERY candidate in the discovery shortlist.
+C. Comparison table with candidate, official domain confidence, status,
+   direct affiliate page inspected (Yes/No), commission (if verified),
+   cookie (if verified), and key unknowns.
+D. Evidence-ranked shortlist. Rank by strength of evidence, not estimated
+   earnings or the Market Discovery score.
+E. Research gaps and next checks.
+
+If the supplied evidence is insufficient for a candidate, do not fill the gap
+with general knowledge. Mark it Not verified and explain what is missing.
+Return a structured professional report.
 """
 
-    raw_response = generate_ai_response(prompt)
-    try:
-        parsed = _extract_json_payload(raw_response)
-    except Exception as exc:
-        print(f"Verification JSON parse failed: {exc}")
-        parsed = {"records": []}
-
-    records = validate_structured_evidence_records(
-        parsed, evidence_bundles, checked_at
-    )
-
-    report = {
-        "date_checked_utc": checked_at,
-        "candidate_count": len(records),
-        "verification_status_counts": {
-            status: sum(1 for item in records if item["verification_status"] == status)
-            for status in sorted(VERIFICATION_STATUSES)
-        },
-        "records": records,
-        "limitations": [
-            "Public page inspection does not prove that a program is accepting applications.",
-            "Terms are retained only when tied to an inspected candidate-specific source URL.",
-            "A missing program reference on inspected pages does not prove that no program exists.",
-        ],
-    }
-    return report, records
-
-
+    return generate_ai_response(prompt)
 
 
 # ==========================================
 # AGENT 3 — COMPETITION ANALYSIS
 # ==========================================
 
-def run_competition_agent(discovery_report, structured_evidence_records):
+def run_competition_agent(discovery_report, verification_report, structured_evidence_records):
 
-    evidence_data = json.dumps(structured_evidence_records, ensure_ascii=False, indent=2)
+    structured_data = _records_json(structured_evidence_records)
+
     prompt = f"""
-You are the Competition Analysis Agent of Affiliate Intelligence, version 7.6.
+You are the Competition Analysis Agent of Affiliate Intelligence.
 
-STRUCTURED EVIDENCE RECORDS (single source of truth for candidate identity,
-official URLs and affiliate verification status):
-{evidence_data}
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
-DISCOVERY CONTEXT (market leads only; not proof of affiliate terms):
+DATA INTEGRITY CONTRACT:
+- Treat the Verification Report as the sole authority for affiliate-program status and terms.
+- Never upgrade a candidate's verification status.
+- Do not repeat commission, cookie, payout, eligibility or application claims unless
+  the Verification Report ties them to an inspected official page.
+- Preserve exact uncertainty; if no matching candidate status is available, say Not verified.
+- Keep estimates and qualitative competition judgments separate from facts.
+- Reproduce the exact verification_status and application_status from the ledger.
+- "Program discontinued — do not promote" must never appear in a viable shortlist,
+  top recommendation, or active-program count.
+- If status is Third-party evidence only, Not verified, or website inspected/program
+  not found, do not describe the affiliate opportunity as verified or currently active.
+- Do not give a numeric attractiveness score for discontinued programs; use N/A.
+- For unverified program status, label the score "Provisional estimate — program unverified"
+  and exclude the candidate from verified-program rankings.
+
+Your mission is to evaluate the competitive landscape
+for the discovered affiliate opportunities.
+
+DISCOVERY REPORT:
 {discovery_report}
 
-Analyze competition and marketing opportunity for each listed candidate.
+VERIFICATION REPORT:
+{verification_report}
 
-For every candidate:
-- Keep the exact candidate name and verification_status from the structured record.
-- Do not add, remove, merge or rename candidates.
-- Do not claim verified commissions, cookie duration or program availability.
-- If a field is "Not verified", preserve that uncertainty.
-- Do not infer that a subscription product has recurring affiliate commissions.
-- Label competition, SEO difficulty and channel assessments as qualitative estimates.
-- Do not invent keyword volumes, traffic, market share or revenue.
+STRUCTURED EVIDENCE LEDGER (DO NOT OVERRIDE):
+{structured_data}
 
-Include:
-1. Candidate and category.
-2. Exact verification status.
-3. Competition level: Low / Medium / High / Unknown.
-4. Reason for qualitative competition assessment.
-5. Potential audience and underserved segments.
-6. SEO, YouTube, Instagram and LinkedIn opportunities where relevant.
-7. Differentiation strategy and main risks.
-8. Preliminary marketing attractiveness score from 1 to 10, explicitly an analytical estimate.
-9. Evidence gaps that limit the assessment.
+STRUCTURED EVIDENCE LEDGER (DO NOT OVERRIDE):
+{structured_data}
 
-Return a concise structured report. Distinguish observed evidence from estimates.
+Analyze each opportunity based on:
+
+1. Likely competition level.
+2. Established competitors and publishers.
+3. SEO difficulty.
+4. Potential search intent.
+5. Content marketing opportunities.
+6. YouTube content opportunities.
+7. Instagram and social media opportunities.
+8. LinkedIn opportunities where relevant.
+9. Potential underserved audiences.
+10. Differentiation opportunities.
+11. Difficulty of building authority.
+12. Long-term content potential.
+
+For each opportunity provide:
+
+- Competition level: Low, Medium or High
+- Reason for the assessment
+- Potential audience
+- Possible content strategy
+- SEO opportunities
+- Social media opportunities
+- Differentiation strategy
+- Main competitive risks
+- Preliminary marketing attractiveness score from 1 to 10, or N/A if the
+  affiliate program is discontinued. Mark unverified opportunities provisional
+  and exclude them from the verified-program shortlist.
+
+IMPORTANT:
+
+You do not have verified keyword-volume or competitor
+traffic data.
+
+Do not invent search volumes, website traffic,
+market shares or competitor revenue.
+
+Clearly label estimates and assumptions.
+
+Finish by ranking the opportunities with the
+most attractive competitive conditions.
+
+Return a structured professional report.
 """
+
     return generate_ai_response(prompt)
-
-
 
 
 # ==========================================
 # AGENT 4 — FINANCIAL ANALYST
 # ==========================================
 
-def run_financial_agent(discovery_report, structured_evidence_records):
+def run_financial_agent(discovery_report, verification_report, structured_evidence_records):
 
-    evidence_data = json.dumps(structured_evidence_records, ensure_ascii=False, indent=2)
+    structured_data = _records_json(structured_evidence_records)
+
     prompt = f"""
-You are the Financial Analyst Agent of Affiliate Intelligence, version 7.6.
+You are the Financial Analyst Agent of Affiliate Intelligence.
 
-STRUCTURED EVIDENCE RECORDS (sole authority for affiliate program status and terms):
-{evidence_data}
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
-DISCOVERY CONTEXT (unverified market leads; do not treat as confirmed terms):
+DATA INTEGRITY CONTRACT:
+- Treat the Verification Report as the sole authority for affiliate-program status and terms.
+- Only report commission, cookie duration, payout threshold or program terms as verified
+  if the Verification Report ties them to an inspected official page.
+- Preserve statuses such as Third-party evidence only, Not verified, Conflicting evidence,
+  or application status unclear.
+- Never infer recurring commissions from a subscription product model.
+- Label all modeled scenarios as hypothetical, not actual earnings.
+- Use only ledger commission/cookie fields as verified terms; if Not verified, do not model numeric affiliate income for that candidate.
+- Any operating-cost estimate must be explicitly labeled as a planning assumption, not sourced company data.
+- Use the ledger's exact verification_status and application_status for every candidate.
+- If program status is discontinued, financial attractiveness must be N/A and the
+  candidate must be excluded from viable affiliate recommendations.
+- If commission and cookie terms are Not verified, do not calculate earnings, CLV,
+  recurring revenue, or numeric payout scenarios for that candidate.
+- If program status is unverified or third-party-only, do not assign a numeric
+  financial attractiveness score; use "Not scored — insufficient verified evidence".
+
+Your responsibility is to evaluate the financial
+potential and risks of each affiliate opportunity.
+
+DISCOVERY REPORT:
 {discovery_report}
 
-For every candidate, assess financial potential and risks.
+VERIFICATION REPORT:
+{verification_report}
 
-MANDATORY DATA RULES:
-- Copy the exact verification_status from its structured evidence record.
-- Use commission and cookie terms only when their corresponding source URL is present.
-- If commission is "Not verified", do not calculate affiliate revenue for that candidate.
-- Never infer recurring affiliate commissions from a subscription business model.
-- Product prices, customer lifetime value, conversion rates, operating costs and
-  earnings are NOT supplied as verified facts. Do not invent them.
-- If useful, provide a clearly labeled hypothetical model with variables rather
-  than invented dollar amounts or percentages. State that the user must supply
-  actual traffic, conversion, commission and cost inputs.
-- Never describe estimates as verified or say "verified via Verification Report"
-  for any value that is not in the structured record.
+Analyze:
 
-For each candidate include:
-1. Candidate and category.
-2. Verification status.
-3. Verified commission / cookie terms, or "Not verified".
-4. Revenue model: known / possible / unknown, clearly distinguished.
-5. Whether recurring affiliate revenue is explicitly verified (Yes / No).
-6. Financial strengths and risks.
-7. Cost categories to investigate; do not invent prices.
-8. Key assumptions and missing inputs.
-9. Financial attractiveness score from 1 to 10, explicitly an analytical estimate
-   based on evidence quality and qualitative fit, not projected earnings.
+1. Affiliate monetization model.
+2. One-time versus recurring commissions.
+3. Potential customer lifetime value.
+4. Possible recurring revenue.
+5. Customer acquisition challenges.
+6. Content production requirements.
+7. Estimated operating costs.
+8. Platform and software costs.
+9. Financial risks.
+10. Scalability.
 
-Finish with a ranked comparison and a short list of data needed for a real forecast.
+For every opportunity include:
+
+- Known commission information
+- Unknown commission information
+- Possible revenue model
+- Recurring revenue potential
+- Cost considerations
+- Financial advantages
+- Financial disadvantages
+- Important assumptions
+- Financial attractiveness score from 1 to 10
+
+IMPORTANT:
+
+Do not invent commission percentages.
+Do not invent product prices.
+Do not promise earnings.
+Do not present hypothetical revenue as actual revenue.
+
+If commission information is missing,
+write "Not verified".
+
+You may provide qualitative financial estimates,
+but clearly label them as estimates.
+
+Do not assume that recurring revenue is available
+unless the evidence supports it.
+
+Finish by ranking opportunities based on their
+potential financial attractiveness and risk.
+
+Return a structured financial report.
 """
+
     return generate_ai_response(prompt)
-
-
 
 
 # ==========================================
@@ -1150,57 +1330,129 @@ Finish with a ranked comparison and a short list of data needed for a real forec
 
 def run_strategy_agent(
     discovery_report,
-    structured_evidence_records,
+    verification_report,
     competition_report,
-    financial_report
+    financial_report,
+    structured_evidence_records
 ):
-    evidence_data = json.dumps(structured_evidence_records, ensure_ascii=False, indent=2)
+
+    structured_data = _records_json(structured_evidence_records)
+
     prompt = f"""
-You are the Chief Strategy Agent of Affiliate Intelligence, version 7.6.
+You are the Chief Strategy Agent of Affiliate Intelligence.
 
-STRUCTURED EVIDENCE RECORDS — SINGLE SOURCE OF TRUTH:
-{evidence_data}
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
-MARKET DISCOVERY REPORT (discovery leads only):
+FINAL DATA INTEGRITY CONTRACT:
+- Verification Report is the single source of truth for affiliate-program status and terms.
+- Do not claim a program is active, accepting applications, or verified unless the
+  Verification Report supports that exact candidate and statement.
+- Preserve exact status; distinguish official evidence, third-party claims, estimates and unknowns.
+- Disclose conflicts; do not silently choose or reconcile contradictory reports.
+- Never call a candidate fully verified solely from a candidate/domain text match; domain ownership requires independent authentication.
+- Distinguish candidate-domain match from authenticated official ownership.
+- Never reuse another brand's commission, cookie, payout or eligibility terms.
+- Copy exact verification_status and application_status from the ledger.
+- A discontinued program is disqualified: never rank it, recommend it, or describe
+  it as a viable monetization opportunity.
+- Do not call a candidate fully verified unless official domain ownership and
+  current program terms have been independently authenticated; the current ledger
+  does not independently authenticate domain ownership.
+- Exclude unverified and third-party-only candidates from the verified shortlist.
+- Do not silently reconcile conflicts between reports; list them as unresolved.
+
+You are responsible for making the final strategic decision.
+
+You must compare the work of all four specialized agents.
+
+MARKET DISCOVERY REPORT:
 {discovery_report}
 
-COMPETITION REPORT (qualitative estimates):
+VERIFICATION REPORT:
+{verification_report}
+
+COMPETITION REPORT:
 {competition_report}
 
-FINANCIAL REPORT (must retain assumptions and unknowns):
+FINANCIAL REPORT:
 {financial_report}
 
-MISSION:
-Recommend the strongest opportunities for an AI-powered affiliate media business.
+STRUCTURED EVIDENCE LEDGER (FINAL AUTHORITY FOR TERMS):
+{structured_data}
 
-NON-NEGOTIABLE DATA INTEGRITY:
-- Use exactly the candidates in the structured evidence records.
-- Copy each candidate's verification_status exactly.
-- Do not describe a candidate as fully verified unless its status is
-  "official_affiliate_page_inspected_program_evidence_found".
-- An inspected affiliate page does not automatically mean terms or open
-  applications are verified.
-- Use commission/cookie terms only if present in the structured record with
-  their corresponding source URL.
-- Do not resolve contradictions by guessing.
-- Never invent revenue, commission, traffic, pricing or earnings.
-- Clearly separate verified facts, estimates and unknowns.
+YOUR MISSION:
 
-OUTPUT:
-A. Executive summary of the market research and evidence quality.
-B. Ranked shortlist with candidate, category, exact verification status,
-   evidence quality, competition estimate, financial unknowns and rationale.
-C. Top three recommendations for the NEXT RESEARCH STEP, not automatic promotion.
-D. Lower-priority candidates and reasons.
-E. Practical next actions to close evidence gaps.
-F. Strategic conclusion.
+Identify the strongest affiliate business opportunities
+for building a scalable AI-powered affiliate media agency.
 
-Make clear that rankings/scores are preliminary analytical judgments, not measured
-market performance. Return a professional structured report.
+Evaluate each opportunity based on:
+
+1. Market attractiveness.
+2. Product usefulness.
+3. Strength of available evidence.
+4. Affiliate program verification status.
+5. Financial potential.
+6. Recurring revenue potential.
+7. Competition.
+8. Content creation potential.
+9. Marketing difficulty.
+10. Business risks.
+11. Scalability.
+12. Suitability for a website, YouTube,
+    Instagram and LinkedIn strategy.
+
+YOUR FINAL REPORT MUST INCLUDE:
+
+A. EXECUTIVE SUMMARY
+
+Explain the overall market findings.
+
+B. RANKED SHORTLIST
+
+Rank the strongest opportunities and explain why.
+
+C. TOP THREE RECOMMENDATIONS
+
+For each recommendation include:
+- Company
+- Product
+- Category
+- Target audience
+- Evidence available
+- Verification status
+- Financial potential
+- Competition
+- Recommended marketing channels
+- Main risks
+- Why it deserves attention
+
+D. REJECTED OR LOWER-PRIORITY OPPORTUNITIES
+
+Explain why some opportunities should not
+be prioritized.
+
+E. NEXT ACTIONS
+
+Provide a practical action plan for further research.
+
+F. STRATEGIC CONCLUSION
+
+Recommend which opportunities should receive
+the next round of investigation.
+
+IMPORTANT:
+
+Do not invent facts or financial data.
+Do not treat preliminary scores as verified data.
+Do not recommend an opportunity as fully verified
+when the verification report says otherwise.
+
+Distinguish facts, estimates and unknown information.
+
+Return a professional executive strategy report.
 """
+
     return generate_ai_response(prompt)
-
-
 
 
 # ==========================================
@@ -1208,7 +1460,9 @@ market performance. Return a professional structured report.
 # ==========================================
 
 def run_agent_workflow(request: ResearchRequest):
-    """Run the five agents sequentially while preserving structured evidence."""
+    """
+    Run agents sequentially and preserve completed outputs if a later agent fails.
+    """
     web_results = collect_market_research(request.niche)
 
     if not web_results:
@@ -1227,7 +1481,11 @@ def run_agent_workflow(request: ResearchRequest):
     structured_evidence_records = []
 
     try:
-        discovery = run_discovery_agent(request, web_results, market_page_evidence)
+        discovery = run_discovery_agent(
+            request,
+            web_results,
+            market_page_evidence
+        )
         completed["market_discovery"] = {
             "status": "completed",
             "report": discovery
@@ -1240,38 +1498,31 @@ def run_agent_workflow(request: ResearchRequest):
         official_site_evidence = collect_official_site_evidence(
             candidate_search_results
         )
-
-        evidence_bundles = build_candidate_evidence_inputs(
+        structured_evidence_records = build_structured_evidence_records(
             discovered_candidates,
             candidate_searches,
             official_site_evidence
         )
-        verification_checked_at = datetime.now(timezone.utc).isoformat()
-        verification, structured_evidence_records = run_verification_agent(
-            evidence_bundles,
-            verification_checked_at
+        verification = run_verification_agent(
+            discovery,
+            candidate_searches,
+            official_site_evidence,
+            structured_evidence_records
         )
         completed["verification"] = {
             "status": "completed",
-            "report": verification,
-            "structured_evidence_records": structured_evidence_records
+            "report": verification
         }
 
         current_agent = "Competition Analysis Agent"
-        competition = run_competition_agent(
-            discovery,
-            structured_evidence_records
-        )
+        competition = run_competition_agent(discovery, verification, structured_evidence_records)
         completed["competition"] = {
             "status": "completed",
             "report": competition
         }
 
         current_agent = "Financial Analyst Agent"
-        financial = run_financial_agent(
-            discovery,
-            structured_evidence_records
-        )
+        financial = run_financial_agent(discovery, verification, structured_evidence_records)
         completed["financial_analyst"] = {
             "status": "completed",
             "report": financial
@@ -1280,9 +1531,10 @@ def run_agent_workflow(request: ResearchRequest):
         current_agent = "Chief Strategy Agent"
         strategy = run_strategy_agent(
             discovery,
-            structured_evidence_records,
+            verification,
             competition,
-            financial
+            financial,
+            structured_evidence_records
         )
         completed["chief_strategy"] = {
             "status": "completed",
@@ -1290,10 +1542,11 @@ def run_agent_workflow(request: ResearchRequest):
         }
 
     except HTTPException as error:
+        # Return HTTP 200 with explicit partial status so completed work is not lost.
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.6.0",
+            "version": "7.7.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1305,11 +1558,15 @@ def run_agent_workflow(request: ResearchRequest):
                 "detail": error.detail
             },
             "completed_agents": completed,
-            "structured_evidence_records": structured_evidence_records,
             "market_page_evidence": market_page_evidence,
-            "discovered_candidates": discovered_candidates,
-            "candidate_searches": candidate_searches,
+            "discovered_candidates": discovered_candidates if "discovered_candidates" in locals() else [],
+            "candidate_searches": candidate_searches if "candidate_searches" in locals() else [],
             "official_site_evidence": official_site_evidence,
+            "structured_evidence_records": structured_evidence_records,
+            "agent_consistency_audit": build_agent_consistency_audit(
+                structured_evidence_records,
+                {name: item.get("report", "") for name, item in completed.items()}
+            ),
             "source_results": web_results
         }
 
@@ -1318,7 +1575,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.6.0",
+            "version": "7.7.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1330,30 +1587,45 @@ def run_agent_workflow(request: ResearchRequest):
                 "detail": "Unexpected agent error. Check Railway logs."
             },
             "completed_agents": completed,
-            "structured_evidence_records": structured_evidence_records,
             "market_page_evidence": market_page_evidence,
-            "discovered_candidates": discovered_candidates,
-            "candidate_searches": candidate_searches,
+            "discovered_candidates": discovered_candidates if "discovered_candidates" in locals() else [],
+            "candidate_searches": candidate_searches if "candidate_searches" in locals() else [],
             "official_site_evidence": official_site_evidence,
+            "structured_evidence_records": structured_evidence_records,
+            "agent_consistency_audit": build_agent_consistency_audit(
+                structured_evidence_records,
+                {name: item.get("report", "") for name, item in completed.items()}
+            ),
             "source_results": web_results
         }
+
+    agent_consistency_audit = build_agent_consistency_audit(
+        structured_evidence_records,
+        {
+            "verification": verification,
+            "competition": competition,
+            "financial_analyst": financial,
+            "chief_strategy": strategy
+        }
+    )
 
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "7.6.0",
+        "version": "7.7.0",
+        "agent_consistency_audit": agent_consistency_audit,
         "report_generated_at_utc": report_generated_at_utc,
         "workflow": "Five-Agent Affiliate Intelligence System",
         "model": MODEL_NAME,
         "niche": request.niche,
         "search_results_found": len(web_results),
         "agents": completed,
-        "structured_evidence_records": structured_evidence_records,
         "market_page_evidence": market_page_evidence,
         "source_results": web_results,
         "discovered_candidates": discovered_candidates,
         "candidate_searches": candidate_searches,
-        "official_site_evidence": official_site_evidence
+        "official_site_evidence": official_site_evidence,
+        "structured_evidence_records": structured_evidence_records
     }
 
 
@@ -1366,7 +1638,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "7.6.0",
+        "version": "7.7.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
