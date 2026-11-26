@@ -25,7 +25,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="7.4.0"
+    version="7.5.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -631,7 +631,9 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 7.4.
+You are the Market Discovery Agent of Affiliate Intelligence, version 7.5.
+
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
 MISSION:
 Discover, screen, compare and rank promising affiliate business
@@ -668,6 +670,8 @@ REQUIRED WORKFLOW:
 7. Identify likely target audiences and potential content angles.
 8. Look for evidence that an affiliate, referral, partner or creator program
    may exist. A product being popular does not prove it has an affiliate program.
+   Directory inclusion is third-party evidence only, never official confirmation.
+   Do not state that a program is active or accepting applications in Discovery.
 9. Assess recurring-revenue potential only where the business model supports it.
 10. Compare candidates using the same scoring criteria.
 11. Rank the strongest candidates and explain the trade-offs.
@@ -751,7 +755,9 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     inspected_data = json.dumps(official_site_evidence, ensure_ascii=False, indent=2)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 7.4.
+You are the Verification Agent of Affiliate Intelligence, version 7.5.
+
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
 MISSION:
 Audit each company/product candidate from Market Discovery. Your job is to
@@ -841,6 +847,16 @@ def run_competition_agent(discovery_report, verification_report):
     prompt = f"""
 You are the Competition Analysis Agent of Affiliate Intelligence.
 
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
+
+DATA INTEGRITY CONTRACT:
+- Treat the Verification Report as the sole authority for affiliate-program status and terms.
+- Never upgrade a candidate's verification status.
+- Do not repeat commission, cookie, payout, eligibility or application claims unless
+  the Verification Report ties them to an inspected official page.
+- Preserve exact uncertainty; if no matching candidate status is available, say Not verified.
+- Keep estimates and qualitative competition judgments separate from facts.
+
 Your mission is to evaluate the competitive landscape
 for the discovered affiliate opportunities.
 
@@ -904,6 +920,17 @@ def run_financial_agent(discovery_report, verification_report):
 
     prompt = f"""
 You are the Financial Analyst Agent of Affiliate Intelligence.
+
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
+
+DATA INTEGRITY CONTRACT:
+- Treat the Verification Report as the sole authority for affiliate-program status and terms.
+- Only report commission, cookie duration, payout threshold or program terms as verified
+  if the Verification Report ties them to an inspected official page.
+- Preserve statuses such as Third-party evidence only, Not verified, Conflicting evidence,
+  or application status unclear.
+- Never infer recurring commissions from a subscription product model.
+- Label all modeled scenarios as hypothetical, not actual earnings.
 
 Your responsibility is to evaluate the financial
 potential and risks of each affiliate opportunity.
@@ -977,6 +1004,16 @@ def run_strategy_agent(
 
     prompt = f"""
 You are the Chief Strategy Agent of Affiliate Intelligence.
+
+REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
+
+FINAL DATA INTEGRITY CONTRACT:
+- Verification Report is the single source of truth for affiliate-program status and terms.
+- Do not claim a program is active, accepting applications, or verified unless the
+  Verification Report supports that exact candidate and statement.
+- Preserve exact status; distinguish official evidence, third-party claims, estimates and unknowns.
+- Disclose conflicts; do not silently choose or reconcile contradictory reports.
+- Never reuse another brand's commission, cookie, payout or eligibility terms.
 
 You are responsible for making the final strategic decision.
 
@@ -1085,6 +1122,7 @@ def run_agent_workflow(request: ResearchRequest):
             detail="Web search returned no results. Please try again later."
         )
 
+    report_generated_at_utc = datetime.now(timezone.utc).isoformat()
     completed = {}
     current_agent = "Market Discovery Agent"
     market_page_evidence = collect_market_page_evidence(web_results)
@@ -1148,7 +1186,8 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.4.0",
+            "version": "7.5.0",
+            "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
             "niche": request.niche,
@@ -1171,7 +1210,8 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.4.0",
+            "version": "7.5.0",
+            "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
             "niche": request.niche,
@@ -1192,7 +1232,8 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "7.4.0",
+        "version": "7.5.0",
+        "report_generated_at_utc": report_generated_at_utc,
         "workflow": "Five-Agent Affiliate Intelligence System",
         "model": MODEL_NAME,
         "niche": request.niche,
@@ -1215,7 +1256,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "7.4.0",
+        "version": "7.5.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
