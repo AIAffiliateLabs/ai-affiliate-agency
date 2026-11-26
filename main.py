@@ -20,13 +20,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.1: deterministic evidence enforcement, term downgrading, agent-output blocking, and guarded strategy fallback.
+# v8.2: semantic commission matching, deterministic evidence enforcement, agent-output blocking, and guarded strategy fallback.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="8.1.0"
+    version="8.2.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -619,8 +619,31 @@ def _candidate_page_match(candidate_name, page):
     return bool(key and (key in host or key in title))
 
 
+def _commission_percentage_from_sentence(sentence):
+    """Return a percentage only when grammar directly ties it to commission."""
+    text = re.sub(r"\s+", " ", sentence or "").strip()
+    percent = r"(\d{1,3}(?:\.\d{1,2})?\s*%)"
+    patterns = [
+        # "20% commission", "20% recurring commission", "20% affiliate commission"
+        rf"{percent}\s*(?:(?:recurring|affiliate|referral)\s+)?commissions?\b",
+        # "commission of 20%", "commission rate is 20%"
+        rf"\bcommissions?\s*(?:rate\s*)?(?:of|is|:|at)\s*{percent}",
+        # "earn 20% commission", "earn a 20% recurring commission"
+        rf"\b(?:earn|earns|receive|receives|paid|pays?)\s+(?:a\s+)?(?:up\s+to\s+)?{percent}\s*(?:(?:recurring|affiliate|referral)\s+)?commissions?\b",
+        # "earn commission of 20%"
+        rf"\b(?:earn|earns|receive|receives|paid|pays?)\s+(?:a\s+)?(?:recurring\s+)?commissions?\s*(?:of|at)\s*{percent}",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            # The first capture in the first pattern is nested; use the final captured value.
+            value = match.groups()[-1]
+            return re.sub(r"\s+", "", value)
+    return None
+
+
 def _extract_explicit_terms(text):
-    """Extract a term only when a focused sentence explicitly connects value and term."""
+    """Extract numeric terms only when the sentence semantically connects value and term."""
     commission = "Not verified"
     cookie = "Not verified"
     evidence = []
@@ -631,13 +654,13 @@ def _extract_explicit_terms(text):
         sentence = chunk.strip()
         if not sentence or len(sentence) > 500:
             continue
-        if commission == "Not verified" and re.search(r"(?i)\b(commission|commissions|referral fee|payout per sale|earn per sale)\b", sentence):
-            m = re.search(r"(?i)(\d{1,3}(?:\.\d{1,2})?\s*%)", sentence)
-            if m and not re.search(r"(?i)\b(discount|off|save|sale price|tax|vat)\b", sentence):
-                commission = re.sub(r"\s+", "", m.group(1))
+        if commission == "Not verified":
+            commission_value = _commission_percentage_from_sentence(sentence)
+            if commission_value:
+                commission = commission_value
                 evidence.append({"term": "commission", "value": commission, "excerpt": sentence[:350]})
         if cookie == "Not verified" and re.search(r"(?i)\bcookie\b", sentence):
-            m = re.search(r"(?i)(\d{1,4}\s*(?:days?|weeks?|months?))", sentence)
+            m = re.search(r"(?i)\b(\d{1,4}\s*(?:days?|weeks?|months?))\b", sentence)
             if m:
                 cookie = re.sub(r"\s+", " ", m.group(1)).strip()
                 evidence.append({"term": "cookie_duration", "value": cookie, "excerpt": sentence[:350]})
@@ -878,7 +901,7 @@ def build_structured_evidence_records(
 
 
 def _term_evidence_is_authoritative(record, term_name, value):
-    """Return True only for exact candidate-host evidence with focused term/value context."""
+    """Require exact candidate-host evidence whose excerpt semantically supports the term."""
     official_host = _host(record.get("official_url_candidate", ""))
     if not official_host or not value or value == "Not verified":
         return False
@@ -891,15 +914,13 @@ def _term_evidence_is_authoritative(record, term_name, value):
         evidence_url = evidence.get("evidence_url", "")
         evidence_host = _host(evidence_url)
         if term_name == "commission":
-            context_ok = bool(
-                re.search(r"(?i)\b(commission|commissions|referral fee|payout per sale|earn per sale)\b", excerpt)
-                and re.search(r"(?<!\w)\d{1,3}(?:\.\d{1,2})?\s*%", excerpt)
-            )
+            parsed_value = _commission_percentage_from_sentence(excerpt)
+            context_ok = bool(parsed_value and re.sub(r"\s+", "", parsed_value).lower() == re.sub(r"\s+", "", str(value)).lower())
         elif term_name == "cookie_duration":
-            context_ok = bool(
-                re.search(r"(?i)\bcookie\b", excerpt)
-                and re.search(r"(?i)\b\d{1,4}\s*(days?|weeks?|months?)\b", excerpt)
-            )
+            match = re.search(r"(?i)\bcookie\b", excerpt)
+            duration = re.search(r"(?i)\b(\d{1,4}\s*(?:days?|weeks?|months?))\b", excerpt)
+            parsed_value = re.sub(r"\s+", " ", duration.group(1)).strip() if duration else None
+            context_ok = bool(match and parsed_value and parsed_value.lower() == str(value).lower())
         else:
             context_ok = False
         if context_ok and evidence_url and evidence_host == official_host:
@@ -985,7 +1006,7 @@ def build_enforcement_summary(records, ledger_findings, report_findings):
         "agent_claims_blocked": len(report_findings or []),
         "ledger_findings": ledger_findings or [],
         "blocked_agent_claims": report_findings or [],
-        "rule": "Only exact numeric terms supported by focused candidate-host program-page excerpts remain verified. Unsupported report lines are replaced before downstream use."
+        "rule": "Only exact numeric terms supported by focused candidate-host program-page excerpts remain verified. Commission percentages must be grammatically tied to commission; unrelated percentages such as conversion lifts are rejected. Unsupported report lines are replaced before downstream use."
     }
 
 
@@ -1045,23 +1066,8 @@ def build_agent_consistency_audit(records, agent_reports):
                 continue
             matches = [e for e in (record.get("term_evidence") or [])
                        if e.get("term") == term_name and str(e.get("value", "")).replace(" ", "") == str(value).replace(" ", "")]
-            valid = False
-            bad_sources = []
-            for evidence in matches:
-                excerpt = evidence.get("excerpt", "")
-                evidence_host = _host(evidence.get("evidence_url", ""))
-                context_ok = bool(
-                    re.search(r"(?i)\b(commission|commissions|referral fee|payout per sale|earn per sale)\b", excerpt)
-                    and re.search(r"\d+(?:\.\d+)?\s*%", excerpt)
-                ) if term_name == "commission" else bool(
-                    re.search(r"(?i)\bcookie\b", excerpt)
-                    and re.search(r"\d+\s*(days?|weeks?|months?)", excerpt)
-                )
-                same_domain = bool(official_host and evidence_host == official_host)
-                if context_ok and same_domain and evidence.get("evidence_url"):
-                    valid = True
-                    break
-                bad_sources.append(evidence.get("evidence_url", "missing URL"))
+            valid = _term_evidence_is_authoritative(record, term_name, value)
+            bad_sources = [e.get("evidence_url", "missing URL") for e in matches] if not valid else []
             if not valid:
                 findings.append({
                     "candidate": name, "agent": "evidence_ledger", "ledger_status": status,
@@ -1120,7 +1126,7 @@ def build_agent_consistency_audit(records, agent_reports):
         "source_gaps": source_gap_count,
         "unsupported_terms": sum(1 for x in findings if x.get("severity") == "unsupported_term"),
         "findings": findings,
-        "audit_method": "Candidate-host identity check; exact term/value/excerpt/source-host validation; numeric commission/cookie claims checked against ledger; candidate-level status claims checked line by line.",
+        "audit_method": "Candidate-host identity check; exact term/value/excerpt/source-host validation; commission percentages must be grammatically linked to the word commission (not merely share a sentence with it); cookie duration must be explicitly linked to cookie; candidate-level status claims checked line by line.",
         "note": "Rule-based checks cannot authenticate legal domain ownership or understand every paraphrase. A clean audit is not proof that all claims are correct."
     }
 
@@ -1855,7 +1861,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.1.0",
+            "version": "8.2.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1885,7 +1891,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.1.0",
+            "version": "8.2.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1937,7 +1943,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "8.1.0",
+        "version": "8.2.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_generated_at_utc": report_generated_at_utc,
@@ -1964,7 +1970,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "8.1.0",
+        "version": "8.2.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
