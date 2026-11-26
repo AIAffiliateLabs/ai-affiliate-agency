@@ -25,7 +25,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="7.7.0"
+    version="7.8.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -585,7 +585,7 @@ def collect_market_page_evidence(search_results, max_pages: int = 14):
 
 
 # ==========================================
-# STRUCTURED EVIDENCE RECORDS — v7.7
+# STRUCTURED EVIDENCE RECORDS — v7.8
 # ==========================================
 
 def _host(url):
@@ -649,7 +649,8 @@ def _extract_explicit_terms(text):
 def build_structured_evidence_records(
     discovered_candidates,
     candidate_searches,
-    official_site_evidence
+    official_site_evidence,
+    market_sources=None
 ):
     """
     Build deterministic, auditable per-candidate records from the actual fetched
@@ -664,11 +665,25 @@ def build_structured_evidence_records(
         "checked_at_utc", datetime.now(timezone.utc).isoformat()
     )
     records = []
+    market_sources = market_sources or []
 
     for candidate in discovered_candidates or []:
         name = candidate.get("candidate", "")
         search_item = search_by_candidate.get(name.strip().lower(), {})
         search_results = search_item.get("results", [])
+        candidate_key = _candidate_key(name)
+        # Contextual market sources are retained separately and are never
+        # upgraded to candidate-specific proof merely because they mention a brand.
+        related_market_sources = []
+        for source in market_sources:
+            title_desc = f"{source.get('title', '')} {source.get('description', '')}".lower()
+            if candidate_key and candidate_key in _candidate_key(title_desc):
+                related_market_sources.append({
+                    "title": source.get("title", ""),
+                    "url": source.get("url", ""),
+                    "search_query": source.get("search_query", ""),
+                    "evidence_type": "Contextual market discovery lead — not program verification"
+                })
         matched_pages = [
             page for page in pages
             if page.get("candidate", "").strip().lower() == name.strip().lower()
@@ -795,11 +810,27 @@ def build_structured_evidence_records(
             "official_domain_confidence": "Not authenticated",
             "official_domain_match_confidence": confidence,
             "discovery_source_urls": list(dict.fromkeys(
-                [item.get("url") for item in search_results if item.get("url")]
+                [item.get("url") for item in search_results if item.get("url")] +
+                [item.get("url") for item in related_market_sources if item.get("url")]
             )),
+            "candidate_specific_search_sources": [
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "search_query": item.get("search_query", ""),
+                    "evidence_type": "Candidate-specific search lead — not official verification"
+                }
+                for item in search_results if item.get("url")
+            ],
+            "related_market_discovery_sources": related_market_sources,
             "candidate_search_urls": list(dict.fromkeys(
                 [item.get("url") for item in search_results if item.get("url")]
             )),
+            "source_traceability_status": (
+                "Candidate-specific sources retained" if search_results else
+                "Contextual market sources retained; no candidate-specific search result"
+                if related_market_sources else "No discovery source matched this candidate"
+            ),
             "inspected_page_urls": list(dict.fromkeys(
                 [page.get("final_url") or page.get("requested_url") for page in matched_pages
                  if page.get("final_url") or page.get("requested_url")]
@@ -825,46 +856,73 @@ def build_structured_evidence_records(
     return records
 
 
+def _candidate_claim_lines(report_text, candidate_name):
+    """Return only report lines that explicitly name this candidate."""
+    name_pattern = re.compile(rf"(?i)(?<![A-Za-z0-9]){re.escape(candidate_name)}(?![A-Za-z0-9])")
+    return [line.strip() for line in str(report_text or "").splitlines()
+            if name_pattern.search(line) and line.strip()]
+
+
 def build_agent_consistency_audit(records, agent_reports):
-    """
-    Deterministic guardrail audit. It does not rewrite model reports; it flags
-    report text that conflicts with the evidence ledger.
-    """
+    """Audit source completeness and explicit candidate-level claim conflicts."""
     findings = []
-    for record in records or []:
+    records = records or []
+    agent_reports = agent_reports or {}
+
+    for record in records:
         name = record.get("candidate", "")
         status = record.get("verification_status", record.get("program_status", "Not verified"))
-        closed = status == "Program discontinued — do not promote"
-        unsupported = status in ("Third-party evidence only", "Not verified")
-        for agent_name, report in (agent_reports or {}).items():
-            report_text = str(report or "")
-            # Only flag explicit strong claims; generic discussion is not enough.
-            patterns = [
-                rf"(?is)\b{re.escape(name)}\b.{{0,180}}\b(?:fully verified|verified active|actively accepting applications|open for applications)\b",
-                rf"(?is)\b(?:fully verified|verified active|actively accepting applications|open for applications)\b.{{0,180}}\b{re.escape(name)}\b",
-            ]
-            if closed:
-                patterns += [
-                    rf"(?is)\b{re.escape(name)}\b.{{0,180}}\b(?:active program|active affiliate|promote|recommended|top recommendation)\b",
-                    rf"(?is)\b(?:active program|active affiliate|top recommendation)\b.{{0,180}}\b{re.escape(name)}\b",
-                ]
-            if unsupported:
-                patterns += [
-                    rf"(?is)\b{re.escape(name)}\b.{{0,180}}\b(?:verified program|verified commission|verified cookie)\b",
-                    rf"(?is)\b(?:verified program|verified commission|verified cookie)\b.{{0,180}}\b{re.escape(name)}\b",
-                ]
-            if any(re.search(pattern, report_text) for pattern in patterns):
-                findings.append({
-                    "candidate": name,
-                    "agent": agent_name,
-                    "ledger_status": status,
-                    "issue": "Potential report/ledger inconsistency — manual review required"
-                })
+        urls = record.get("discovery_source_urls", [])
+        if not urls:
+            findings.append({
+                "candidate": name,
+                "agent": "evidence_ledger",
+                "ledger_status": status,
+                "issue": "No discovery source URL retained; manual source recovery recommended",
+                "severity": "source_gap"
+            })
+
+        if status == "Program discontinued — do not promote":
+            restricted_claims = re.compile(
+                r"(?i)\b(?:active affiliate program|active affiliate offer|currently accepting applications|open for applications|top recommendation|recommended for promotion|viable affiliate opportunity)\b"
+            )
+        elif status in ("Third-party evidence only", "Not verified",
+                        "Candidate-matched website inspected — program not found in inspected pages"):
+            restricted_claims = re.compile(
+                r"(?i)\b(?:verified affiliate program|verified commission|verified cookie duration|currently accepting applications|open for applications|confirmed active affiliate program)\b"
+            )
+        else:
+            restricted_claims = re.compile(
+                r"(?i)\b(?:currently accepting applications|open for applications|applications are open)\b"
+            )
+
+        for agent_name, report in agent_reports.items():
+            for line in _candidate_claim_lines(report, name):
+                # Negative/uncertainty wording is not a conflict.
+                if re.search(r"(?i)\b(?:not|never|cannot|can't|unable to|unverified|unknown|unclear|not confirmed|not established|do not)\b", line):
+                    continue
+                if restricted_claims.search(line):
+                    findings.append({
+                        "candidate": name,
+                        "agent": agent_name,
+                        "ledger_status": status,
+                        "issue": "Explicit candidate-level claim may conflict with evidence ledger",
+                        "claim_excerpt": line[:350],
+                        "severity": "claim_conflict"
+                    })
+
+    conflict_count = sum(1 for item in findings if item.get("severity") == "claim_conflict")
+    source_gap_count = sum(1 for item in findings if item.get("severity") == "source_gap")
     return {
         "status": "review_required" if findings else "no_conflicts_detected_by_rules",
-        "checks_run": len(records or []) * len(agent_reports or {}),
+        "checks_run": len(records) * len(agent_reports),
+        "records_checked": len(records),
+        "agent_reports_checked": len(agent_reports),
+        "claim_conflicts": conflict_count,
+        "source_gaps": source_gap_count,
         "findings": findings,
-        "note": "Automated text checks are conservative and may miss paraphrased conflicts; absence of findings is not proof of correctness."
+        "audit_method": "Candidate-name and positive-claim checks restricted to the same report line, plus independent discovery-source completeness checks.",
+        "note": "This rule-based audit reduces broad keyword false positives but cannot understand every paraphrase. No findings is not proof of correctness."
     }
 
 
@@ -921,7 +979,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 7.7.
+You are the Market Discovery Agent of Affiliate Intelligence, version 7.8.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1046,7 +1104,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 7.7.
+You are the Verification Agent of Affiliate Intelligence, version 7.8.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1070,6 +1128,11 @@ DETERMINISTIC STRUCTURED EVIDENCE RECORDS (SOURCE OF TRUTH):
 STRUCTURED RECORD RULES:
 - Treat each structured record as the authoritative machine-generated evidence ledger.
 - Repeat its candidate, URLs, status, commission and cookie fields exactly.
+- Preserve candidate_specific_search_sources and related_market_discovery_sources as
+  separate source classes. Contextual discovery sources are leads, not verification.
+- For every material factual claim, provide the exact URL from the ledger or fetched pages.
+- If no candidate-specific source URL exists, explicitly state "No candidate-specific
+  discovery source retained" rather than inventing or borrowing another brand's source.
 - You may explain evidence, but MUST NOT upgrade the record status or fill missing values.
 - "Official URL candidate" is a candidate match, not independently authenticated ownership.
 - Copy verification_status, program_status, application_status, official_domain_confidence,
@@ -1162,6 +1225,8 @@ DATA INTEGRITY CONTRACT:
   the Verification Report ties them to an inspected official page.
 - Preserve exact uncertainty; if no matching candidate status is available, say Not verified.
 - Keep estimates and qualitative competition judgments separate from facts.
+- Cite source URLs from the ledger for candidate-specific factual claims; do not
+  attach a general market source to a specific merchant unless the source names it.
 - Reproduce the exact verification_status and application_status from the ledger.
 - "Program discontinued — do not promote" must never appear in a viable shortlist,
   top recommendation, or active-program count.
@@ -1179,9 +1244,6 @@ DISCOVERY REPORT:
 
 VERIFICATION REPORT:
 {verification_report}
-
-STRUCTURED EVIDENCE LEDGER (DO NOT OVERRIDE):
-{structured_data}
 
 STRUCTURED EVIDENCE LEDGER (DO NOT OVERRIDE):
 {structured_data}
@@ -1255,6 +1317,8 @@ DATA INTEGRITY CONTRACT:
   or application status unclear.
 - Never infer recurring commissions from a subscription product model.
 - Label all modeled scenarios as hypothetical, not actual earnings.
+- Cite exact ledger URLs for factual candidate claims. Contextual market discovery
+  sources must not be presented as evidence of program terms or program availability.
 - Use only ledger commission/cookie fields as verified terms; if Not verified, do not model numeric affiliate income for that candidate.
 - Any operating-cost estimate must be explicitly labeled as a planning assumption, not sourced company data.
 - Use the ledger's exact verification_status and application_status for every candidate.
@@ -1348,6 +1412,8 @@ FINAL DATA INTEGRITY CONTRACT:
 - Do not claim a program is active, accepting applications, or verified unless the
   Verification Report supports that exact candidate and statement.
 - Preserve exact status; distinguish official evidence, third-party claims, estimates and unknowns.
+- Cite the exact candidate-specific ledger URL beside every factual claim. Do not
+  transfer evidence from another candidate or use contextual market leads as program proof.
 - Disclose conflicts; do not silently choose or reconcile contradictory reports.
 - Never call a candidate fully verified solely from a candidate/domain text match; domain ownership requires independent authentication.
 - Distinguish candidate-domain match from authenticated official ownership.
@@ -1501,7 +1567,8 @@ def run_agent_workflow(request: ResearchRequest):
         structured_evidence_records = build_structured_evidence_records(
             discovered_candidates,
             candidate_searches,
-            official_site_evidence
+            official_site_evidence,
+            market_sources=web_results
         )
         verification = run_verification_agent(
             discovery,
@@ -1546,7 +1613,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.7.0",
+            "version": "7.8.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1575,7 +1642,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "7.7.0",
+            "version": "7.8.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -1612,7 +1679,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "7.7.0",
+        "version": "7.8.0",
         "agent_consistency_audit": agent_consistency_audit,
         "report_generated_at_utc": report_generated_at_utc,
         "workflow": "Five-Agent Affiliate Intelligence System",
@@ -1638,7 +1705,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "7.7.0",
+        "version": "7.8.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
