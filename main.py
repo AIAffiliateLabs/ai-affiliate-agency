@@ -181,3 +181,69 @@ def ask_ai(request: AIRequest):
         "model": MODEL_NAME,
         "response": result
     }
+
+class AffiliateAnalysisRequest(BaseModel):
+    company_name: str
+    product_name: str
+    product_description: str = "Not provided"
+    affiliate_details: str = "Not verified"
+    target_audience: str = "Not specified"
+
+
+@app.post("/analyze-affiliate")
+def analyze_affiliate(request: AffiliateAnalysisRequest):
+
+    prompt = f"""
+    You are the Affiliate Program Analyst
+    of a professional AI and SaaS affiliate agency.
+
+    Analyze the following affiliate opportunity:
+
+    COMPANY: {request.company_name}
+    PRODUCT: {request.product_name}
+    DESCRIPTION: {request.product_description}
+    AFFILIATE DETAILS: {request.affiliate_details}
+    TARGET AUDIENCE: {request.target_audience}
+
+    Analyze these areas:
+
+    1. Product value and market demand.
+    2. Target audience and ideal customers.
+    3. Affiliate commission model.
+    4. Recurring revenue potential.
+    5. Cookie duration and program conditions.
+    6. Competition and marketing difficulty.
+    7. Advantages and disadvantages.
+    8. Potential marketing channels.
+    9. Main risks.
+    10. Overall opportunity score from 1 to 10.
+
+    IMPORTANT RULES:
+
+    - Do not invent commission percentages.
+    - Do not invent cookie durations.
+    - Do not claim program details are verified.
+    - Mark missing information as "Not verified".
+    - Clearly distinguish facts from estimates.
+    - Do not invent sources or URLs.
+    - Do not promise earnings or guaranteed results.
+
+    Finish with:
+    A. Overall assessment.
+    B. Recommendation: High, Medium or Low potential.
+    C. Information that must be verified.
+    D. Recommended next steps.
+
+    Write a structured professional report.
+    """
+
+    result = generate_ai_response(prompt)
+
+    return {
+        "status": "success",
+        "agent": "Affiliate Analyst",
+        "model": MODEL_NAME,
+        "company": request.company_name,
+        "product": request.product_name,
+        "analysis": result
+    }
