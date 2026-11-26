@@ -20,13 +20,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v8.6: official program/application URL extraction, deterministic application and commercial readiness scoring, expanded source recovery, candidate-scoped evidence, semantic enforcement, and cross-agent consistency checks.
+# v8.7: strict affiliate application-route validation, safer Gemini rate-limit handling, and retained v8.6 evidence/readiness controls.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="8.6.0"
+    version="8.7.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -75,12 +75,14 @@ def get_gemini_client():
 
 
 def generate_ai_response(prompt: str):
-    """
-    Call Gemini with bounded exponential backoff for transient 503/429 errors.
-    The function never switches models or enables billing automatically.
+    """Call the configured Gemini model with bounded retries for service outages.
+
+    HTTP 429 is returned immediately: repeating a request when the provider has
+    exhausted a quota usually wastes time and can worsen rate pressure. The app
+    never changes models, keys, quotas, or billing automatically.
     """
     client = get_gemini_client()
-    max_attempts = 4
+    max_attempts = 3  # Initial attempt plus at most two retries for HTTP 503 only.
     last_error = None
 
     for attempt in range(max_attempts):
@@ -89,48 +91,42 @@ def generate_ai_response(prompt: str):
                 model=MODEL_NAME,
                 contents=prompt
             )
-
             if not response.text:
                 raise RuntimeError("Gemini returned an empty response.")
-
             return response.text
 
         except Exception as error:
             last_error = error
             error_message = str(error)
-            print(
-                f"Gemini error on attempt {attempt + 1}/{max_attempts}: "
-                f"{error_message}"
-            )
+            print(f"Gemini error on attempt {attempt + 1}/{max_attempts}: {error_message}")
 
-            is_unavailable = "503" in error_message or "UNAVAILABLE" in error_message
             is_rate_limited = "429" in error_message or "RESOURCE_EXHAUSTED" in error_message
+            is_unavailable = "503" in error_message or "UNAVAILABLE" in error_message
 
-            if is_unavailable or is_rate_limited:
+            if is_rate_limited:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Gemini returned HTTP 429 (rate limit or quota). The request "
+                        "was not repeated because quota-related 429 responses are not "
+                        "reliably fixed by immediate retries. Wait for the provider's "
+                        "quota window to reset, then retry once. No billing, model, "
+                        "or API-key settings were changed."
+                    )
+                )
+
+            if is_unavailable:
                 if attempt < max_attempts - 1:
-                    # 3s, 6s, 12s; bounded to avoid long request hangs.
-                    wait_seconds = min(3 * (2 ** attempt), 12)
-                    print(f"Retrying Gemini request in {wait_seconds} seconds.")
+                    wait_seconds = min(5 * (2 ** attempt), 15)
+                    print(f"Gemini unavailable; retrying in {wait_seconds} seconds.")
                     time.sleep(wait_seconds)
                     continue
-
-                if is_rate_limited:
-                    raise HTTPException(
-                        status_code=429,
-                        detail=(
-                            "Gemini rate limit or free-tier quota was reached "
-                            "after automatic retries. Wait and try again. "
-                            "No billing changes were made."
-                        )
-                    )
-
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "Gemini is experiencing high demand and remained "
-                        "unavailable after automatic retries. Please try again "
-                        "later. Completed agent results, if any, are preserved "
-                        "in the workflow error response."
+                        "Gemini remained unavailable after bounded retries. "
+                        "Completed agent results, if any, are preserved in the "
+                        "workflow error response."
                     )
                 )
 
@@ -764,12 +760,49 @@ def _unique_nonempty(values):
 
 
 def _is_application_url(url, anchor=""):
-    value = f"{url} {anchor}".lower()
-    return any(term in value for term in (
-        "apply", "application", "signup", "sign-up", "register",
-        "join", "impact.com", "partnerstack", "cj.com", "awin.com",
-        "shareasale", "rakutenadvertising", "avantlink"
-    ))
+    """Accept only affiliate-specific application routes, not generic signups.
+
+    A network hostname alone is insufficient. Network destinations require an
+    explicit affiliate/referral/publisher cue in the link text or URL path.
+    Generic merchant signup, agency onboarding, and unrelated regulatory links
+    are deliberately excluded.
+    """
+    try:
+        parsed = urlparse(str(url or ""))
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https") or not host:
+        return False
+
+    text = f"{url} {anchor}".lower()
+    reject_terms = (
+        "agency", "agencies", "solution partner", "technology partner",
+        "integration partner", "reseller", "merchant signup", "store signup",
+        "admin.shopify.com/signup", "federalregister.gov", "joinhoney.com"
+    )
+    if any(term in text for term in reject_terms):
+        return False
+
+    affiliate_terms = (
+        "affiliate", "affiliates", "referral", "publisher", "creator affiliate",
+        "affiliate partner", "affiliate program", "affiliate application"
+    )
+    has_affiliate_context = any(term in text for term in affiliate_terms)
+    if not has_affiliate_context:
+        return False
+
+    # Require a meaningful affiliate/referral route or a recognized affiliate
+    # network destination paired with explicit affiliate wording.
+    route_terms = ("affiliate", "referral", "publisher", "partner-program", "partner_program")
+    network_hosts = (
+        "partnerstack.com", "impact.com", "cj.com", "awin.com",
+        "shareasale.com", "rakutenadvertising.com", "avantlink.com"
+    )
+    path_is_specific = any(term in path for term in route_terms)
+    is_network = any(host == domain or host.endswith("." + domain) for domain in network_hosts)
+    return path_is_specific or is_network
 
 
 def build_readiness_assessment(record):
@@ -1154,9 +1187,9 @@ def _line_has_unsupported_term_claim(line, candidate):
 def _normalize_report_version(report_text):
     """Replace stale self-reported platform versions in generated agent prose."""
     text = str(report_text or "")
-    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-5](?:\.0)?", r"\g<1>8.6.0", text)
-    text = re.sub(r"(?i)(\bversion\s+)8\.[0-5](?:\.0)?", r"\g<1>8.6.0", text)
-    text = re.sub(r"(?i)(\bv)8\.[0-5](?:\.0)?\b", r"\g<1>8.6.0", text)
+    text = re.sub(r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*)8\.[0-6](?:\.0)?", r"\g<1>8.7.0", text)
+    text = re.sub(r"(?i)(\bversion\s+)8\.[0-6](?:\.0)?", r"\g<1>8.7.0", text)
+    text = re.sub(r"(?i)(\bv)8\.[0-6](?:\.0)?\b", r"\g<1>8.7.0", text)
     return text
 
 
@@ -1260,7 +1293,7 @@ def _candidate_claim_sentences(report_text, candidate_name):
 
 
 def _candidate_claim_lines(report_text, candidate_name):
-    """Backward-compatible alias; attribution is sentence-scoped in v8.6."""
+    """Backward-compatible alias; attribution is sentence-scoped in v8.7."""
     return _candidate_claim_sentences(report_text, candidate_name)
 
 
@@ -1371,12 +1404,12 @@ def build_agent_consistency_audit(records, agent_reports):
 def build_report_metadata(agent_reports):
     """Report stale agent version labels without silently treating them as evidence issues."""
     stale = []
-    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-5](?:\.0)?\b")
+    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)8\.[0-6](?:\.0)?\b")
     for agent_name, report in (agent_reports or {}).items():
         if version_pattern.search(str(report or "")):
             stale.append(agent_name)
     return {
-        "application_version": "8.6.0",
+        "application_version": "8.7.0",
         "agent_reports_with_stale_version_labels": stale,
         "status": "passed" if not stale else "review_required",
         "version_policy": "All agent prompts and generated report version labels must match the running application version."
@@ -1435,7 +1468,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 8.6.
+You are the Market Discovery Agent of Affiliate Intelligence, version 8.7.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1560,7 +1593,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 8.6.
+You are the Verification Agent of Affiliate Intelligence, version 8.7.
 
 V8 STRICT EVIDENCE RULES:
 - The structured ledger is deterministic and authoritative; do not upgrade it.
@@ -1900,7 +1933,7 @@ FINAL DATA INTEGRITY CONTRACT:
   measure evidence completeness only, not approval probability or earnings.
 - Separate Application Readiness from Commercial Readiness. Do not rank a high
   application-readiness score as proof of profitable economics.
-- Prefer exact official_program_urls and application_urls from the ledger; never
+- Prefer exact official_program_urls and validated affiliate-specific application_urls from the ledger; never
   invent or reconstruct a signup URL. If none is present, say so.
 - A discontinued program is disqualified: never rank it, recommend it, or describe
   it as a viable monetization opportunity.
@@ -2137,7 +2170,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.6.0",
+            "version": "8.7.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2176,7 +2209,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "8.6.0",
+            "version": "8.7.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Affiliate Intelligence System",
             "model": MODEL_NAME,
@@ -2237,7 +2270,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "8.6.0",
+        "version": "8.7.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2286,7 +2319,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "8.6.0",
+        "version": "8.7.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 5
