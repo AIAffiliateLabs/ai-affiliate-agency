@@ -1,31 +1,28 @@
 
 import os
+import time
+
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google import genai
-from google.genai import types
 
 app = FastAPI(
     title="AI Affiliate Agency",
     description="AI-powered affiliate research platform",
-    version="3.0.0"
+    version="4.0.0"
 )
 
+MODEL_NAME = "gemini-3.8-flash"
+
+
 class ResearchRequest(BaseModel):
-    niche: str = "AI and SaaS software"
-    number_of_programs: int = 10
+    niche: str = "AI tools and SaaS software"
+    number_of_programs: int = Field(default=10, ge=1, le=10)
 
-@app.get("/")
-def home():
-    return {
-        "status": "online",
-        "project": "AI Affiliate Agency",
-        "version": "3.0.0"
-    }
 
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
+class AIRequest(BaseModel):
+    prompt: str
+
 
 def get_gemini_client():
     api_key = os.getenv("GEMINI_API_KEY")
@@ -33,87 +30,156 @@ def get_gemini_client():
     if not api_key:
         raise HTTPException(
             status_code=500,
-            detail="Gemini API key is missing."
+            detail="Gemini API key is missing in Railway."
         )
 
     return genai.Client(api_key=api_key)
 
-@app.get("/ai-test")
-def ai_test():
+
+def generate_ai_response(prompt: str):
     client = get_gemini_client()
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents="Introduce yourself in two short sentences."
-        )
-        return {
-            "status": "success",
-            "response": response.text
-        }
-    except Exception as error:
-        print(f"Gemini error: {error}")
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini connection failed."
-        )
+    for attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt
+            )
+
+            if not response.text:
+                raise Exception("Gemini returned an empty response.")
+
+            return response.text
+
+        except Exception as error:
+            error_message = str(error)
+            print(f"Gemini error: {error_message}")
+
+            if "429" in error_message:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Gemini free-tier quota or rate limit reached. Try again later."
+                )
+
+            if "503" in error_message:
+                if attempt == 0:
+                    time.sleep(3)
+                    continue
+
+                raise HTTPException(
+                    status_code=503,
+                    detail="Gemini is temporarily unavailable. Try again later."
+                )
+
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini request failed. Check Railway logs."
+            )
+
+
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "project": "AI Affiliate Agency",
+        "version": "4.0.0",
+        "ai_model": MODEL_NAME
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
+
+@app.get("/ai-test")
+def ai_test():
+    prompt = """
+    Introduce yourself as the AI assistant
+    of an AI and SaaS affiliate marketing agency.
+
+    Explain your main responsibilities in two short sentences.
+    """
+
+    result = generate_ai_response(prompt)
+
+    return {
+        "status": "success",
+        "model": MODEL_NAME,
+        "response": result
+    }
+
 
 @app.post("/research")
 def research(request: ResearchRequest):
-    client = get_gemini_client()
 
     prompt = f"""
-    You are the Affiliate Market Research Agent
-    for an AI and SaaS affiliate marketing agency.
+    You are the Affiliate Market Research Analyst
+    of an AI and SaaS affiliate marketing agency.
 
-    Research the niche: {request.niche}
+    Your task is to analyze this niche:
 
-    Find up to {request.number_of_programs}
-    relevant affiliate programs.
+    NICHE: {request.niche}
 
-    For each program, investigate:
+    Prepare a report covering up to
+    {request.number_of_programs} potential affiliate opportunities.
+
+    For each opportunity analyze:
+
     1. Company and product name
     2. Product category
-    3. Official website
-    4. Affiliate program website
-    5. Commission structure
-    6. Whether recurring commissions are offered
-    7. Cookie duration
-    8. Main affiliate requirements
-    9. Potential advantages and disadvantages
+    3. Official website, if known
+    4. Affiliate program, if known
+    5. Possible commission model
+    6. Recurring commission potential
+    7. Target customers
+    8. Main advantages
+    9. Main disadvantages
+    10. Marketing potential
 
-    Use current Google Search information.
-    Include source URLs for factual claims.
+    IMPORTANT RULES:
 
-    Never invent commission rates, cookie durations,
-    program availability, or affiliate terms.
+    - You do not have live internet search in this version.
+    - Do not claim that you visited or verified websites.
+    - Never invent exact commission percentages.
+    - Never invent cookie durations.
+    - Never claim an affiliate program is currently open
+      unless that information has been verified.
+    - Mark unknown information as "Not verified".
+    - Clearly distinguish facts from estimates.
+    - Do not invent sources or URLs.
 
-    If information cannot be verified, write
-    "Not verified".
+    At the end:
 
-    Finish with a ranked list of the strongest
-    opportunities and explain your ranking.
+    A. Rank the strongest opportunities.
+    B. Explain why they are promising.
+    C. Recommend three products for further verification.
+    D. Explain what information must be checked
+       on each company's official affiliate page.
+
+    Return a clear, professional research report.
     """
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())]
-            )
-        )
+    result = generate_ai_response(prompt)
 
-        return {
-            "status": "success",
-            "agent": "Affiliate Market Researcher",
-            "niche": request.niche,
-            "report": response.text
-        }
+    return {
+        "status": "success",
+        "agent": "Affiliate Market Researcher",
+        "model": MODEL_NAME,
+        "niche": request.niche,
+        "programs_requested": request.number_of_programs,
+        "live_web_search": False,
+        "report": result
+    }
 
-    except Exception as error:
-        print(f"Research error: {error}")
-        raise HTTPException(
-            status_code=502,
-            detail="Research failed. Check Railway logs."
-        )
+
+@app.post("/ask-ai")
+def ask_ai(request: AIRequest):
+
+    result = generate_ai_response(request.prompt)
+
+    return {
+        "status": "success",
+        "model": MODEL_NAME,
+        "response": result
+    }
