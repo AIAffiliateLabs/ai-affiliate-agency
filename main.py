@@ -27,7 +27,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="9.1.0"
+    version="9.2.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -2236,7 +2236,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.1.0",
+            "version": "9.2.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2275,7 +2275,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.1.0",
+            "version": "9.2.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2336,7 +2336,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "9.1.0",
+        "version": "9.2.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2377,50 +2377,81 @@ def run_agent_workflow(request: ResearchRequest):
 
 
 
+def _normalized_percent(value):
+    match = re.search(r"(\d{1,3}(?:\.\d{1,2})?)\s*%", str(value or ""))
+    return f"{match.group(1)}%" if match else None
+
+
+def _normalized_money(value):
+    match = re.search(r"\$\s*(\d+(?:,\d{3})*(?:\.\d{1,2})?)", str(value or ""))
+    return f"${match.group(1).replace(',', '')}" if match else None
+
+
 def enforce_content_evidence(content, candidate_record):
-    """Deterministically remove affiliate-term claims that the selected ledger does not verify."""
+    """Post-generation deterministic gate for affiliate numeric terms.
+
+    The model prompt is advisory; this function is the enforceable control.
+    It checks each sentence against the selected, normalized Evidence Ledger
+    and replaces unsupported commission, payout and cookie claims.
+    """
     text = str(content or "")
     findings = []
-    commission = candidate_record.get("commission", "Not verified")
-    cookie = candidate_record.get("cookie_duration", "Not verified")
-    status = candidate_record.get("verification_status", "Not verified")
+    commission_value = candidate_record.get("commission", "Not verified")
+    cookie_value = candidate_record.get("cookie_duration", "Not verified")
+    commission_pct = _normalized_percent(commission_value)
+    commission_money = _normalized_money(commission_value)
+    cookie_days = _extract_duration_value(str(cookie_value)) if cookie_value not in (None, "", "Not verified") else None
     replacement = (
-        "Affiliate program availability and terms should be confirmed directly "
-        "through the official partner platform before relying on or promoting them."
+        "Affiliate program terms, including commissions, payout amounts and cookie duration, "
+        "must be confirmed directly through the official partner platform before publication."
     )
 
     def check_sentence(sentence):
         lower = sentence.lower()
         reasons = []
-        has_percentage = bool(re.search(r"\b\d+(?:\.\d+)?\s*%", sentence))
-        mentions_commission = bool(re.search(
-            r"\b(?:commission|commissions|payout|earnings|earn|earning|paid|payment)\b", lower
+        commission_context = bool(re.search(
+            r"\b(?:commission|commissions|payout|payouts|earnings|earn|earning|paid|payment|referral fee)\b", lower
         ))
-        if commission in (None, "", "Not verified") and mentions_commission and has_percentage:
-            reasons.append("commission or payout amount is Not verified in the Evidence Ledger")
+        cookie_context = bool(re.search(r"\bcookies?\b", lower))
 
-        mentions_cookie = bool(re.search(r"\bcookies?\b|\bcookie\s+(?:window|period|duration)\b", lower))
-        has_duration = bool(re.search(
-            r"\b\d+\s*[- ]?(?:day|days|week|weeks|month|months|hour|hours)\b|"
-            r"\b(?:one|two|three|four|five|seven|thirty|sixty|ninety)\s+(?:day|days|week|weeks)\b", lower
-        ))
-        if cookie in (None, "", "Not verified") and mentions_cookie and has_duration:
-            reasons.append("cookie duration is Not verified in the Evidence Ledger")
+        if commission_context:
+            mentioned_pct = _commission_percentage_from_sentence(sentence)
+            if mentioned_pct:
+                if not commission_pct:
+                    reasons.append("commission percentage is Not verified in the Evidence Ledger")
+                elif mentioned_pct != commission_pct:
+                    reasons.append(f"commission percentage {mentioned_pct} does not match Evidence Ledger value {commission_pct}")
 
-        if status != "Candidate-host affiliate/referral page inspected — program evidence found":
-            if re.search(r"\b(?:has|offers|operates|runs)\s+(?:an?\s+)?(?:affiliate|publisher)\s+(?:partner\s+)?program\b", lower):
-                reasons.append("affiliate-program existence is not confirmed by the selected Evidence Ledger status")
-        return reasons
+            # A fixed/maximum payout amount is a separate claim from a commission rate.
+            money_match = _normalized_money(sentence)
+            if money_match:
+                if not commission_money:
+                    reasons.append(f"payout amount {money_match} is not verified in the Evidence Ledger")
+                elif money_match != commission_money:
+                    reasons.append(f"payout amount {money_match} does not match Evidence Ledger value {commission_money}")
+
+        if cookie_context:
+            mentioned_duration = _extract_duration_value(sentence)
+            if mentioned_duration:
+                if not cookie_days:
+                    reasons.append("cookie duration is Not verified in the Evidence Ledger")
+                elif mentioned_duration.lower() != cookie_days.lower():
+                    reasons.append(f"cookie duration {mentioned_duration} does not match Evidence Ledger value {cookie_days}")
+            elif re.search(r"(?i)\b(?:long|extended|generous|robust|attractive|lengthy|favorable|favourable)\s+cookie\b|\bcookie\s+(?:window|duration|period)\s+(?:is\s+)?(?:long|extended|generous|robust|attractive|favorable|favourable)", sentence):
+                if not cookie_days:
+                    reasons.append("qualitative cookie-duration claim is unsupported because cookie duration is Not verified")
+        return list(dict.fromkeys(reasons))
 
     output_lines = []
     for line in text.splitlines(keepends=True):
-        line_body = line.rstrip("\r\n")
-        line_ending = line[len(line_body):]
-        # Keep Markdown headings and list prefixes intact; inspect prose sentence by sentence.
-        parts = re.split(r"(?<=[.!?])(\s+)", line_body)
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        # Sentence-level replacement preserves the rest of the article and its Markdown.
+        parts = re.split(r"(?<=[.!?])(?=\s+|$)", body)
         rebuilt = []
-        for index in range(0, len(parts), 2):
-            sentence = parts[index]
+        for sentence in parts:
+            if not sentence:
+                continue
             reasons = check_sentence(sentence)
             if reasons:
                 findings.append({
@@ -2428,28 +2459,26 @@ def enforce_content_evidence(content, candidate_record):
                     "reasons": reasons,
                     "candidate": candidate_record.get("candidate", "")
                 })
-                # Preserve a heading/list marker that may share the same line.
                 prefix_match = re.match(r"^(\s*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+))", sentence)
                 prefix = prefix_match.group(1) if prefix_match else ""
                 rebuilt.append(prefix + replacement)
             else:
                 rebuilt.append(sentence)
-            if index + 1 < len(parts):
-                rebuilt.append(parts[index + 1])
-        output_lines.append("".join(rebuilt) + line_ending)
+        output_lines.append("".join(rebuilt) + ending)
 
     return "".join(output_lines), {
         "status": "claims_blocked_for_human_review" if findings else "passed",
         "candidate": candidate_record.get("candidate", ""),
-        "ledger_verification_status": status,
-        "commission_from_ledger": commission,
-        "cookie_duration_from_ledger": cookie,
+        "ledger_verification_status": candidate_record.get("verification_status", "Not verified"),
+        "commission_from_ledger": commission_value,
+        "cookie_duration_from_ledger": cookie_value,
         "claims_blocked": len(findings),
         "findings": findings,
         "rules": [
-            "Unverified commission or payout percentages are replaced with a neutral verification statement.",
-            "Unverified cookie durations are replaced with a neutral verification statement.",
-            "Affiliate-program existence is not presented as confirmed unless the ledger records candidate-host program evidence.",
+            "Commission percentages must match the exact percentage in the selected Evidence Ledger record.",
+            "Payout dollar amounts are blocked unless that exact amount is present in the selected Evidence Ledger commission field.",
+            "Cookie durations must match the exact duration in the selected Evidence Ledger record; unknown durations are blocked.",
+            "A candidate-host page or a source URL alone does not authorize an unsupported numeric term.",
             "The result remains a draft and requires human approval before publication."
         ]
     }
@@ -2494,7 +2523,7 @@ def run_content_creation_agent(request: ContentCreationRequest):
 
     selected_record = json.dumps(selected, ensure_ascii=False, indent=2)
     prompt = f"""
-You are the Content Creation Agent, Agent 6 of Affiliate Intelligence v9.1.
+You are the Content Creation Agent, Agent 6 of Affiliate Intelligence v9.2.
 Create ONE polished, useful, original marketing content asset for human review.
 
 USER REQUEST
@@ -2556,16 +2585,18 @@ Make the content genuinely useful to the audience, not generic filler. Adapt
 structure to the requested content type. Return the result in {request.language}.
 """
 
-    result = generate_ai_response(prompt)
+    generated_result = generate_ai_response(prompt)
+    result, quality_control = enforce_content_evidence(generated_result, selected)
     return {
         "status": "draft_created",
         "project": "Affiliate Intelligence",
-        "version": "9.1.0",
+        "version": "9.2.0",
         "agent": "Content Creation Agent",
         "candidate": request.candidate,
         "content_type": request.content_type,
         "approval_status": "DRAFT — NOT PUBLISHED",
         "human_approval_required": True,
+        "content_quality_control": quality_control,
         "content": result
     }
 
@@ -2578,7 +2609,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "9.1.0",
+        "version": "9.2.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 6
