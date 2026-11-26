@@ -4,3 +4,4 @@ uvicorn[standard]
 crewai
 google-genai
 python-dotenv
+ddgs
