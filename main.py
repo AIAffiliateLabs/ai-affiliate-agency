@@ -21,13 +21,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v9.3: adds candidate-scoped source provenance, public-page reachability and CTA link validation; preserves v9.2 Evidence Gate.
+# v9.4: adds claim-to-source candidate mapping, source URL classification, CTA destination audit and review-coverage score; preserves v9.3 and v9.2 controls.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="9.3.0"
+    version="9.4.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -2236,7 +2236,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.3.0",
+            "version": "9.4.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2275,7 +2275,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.3.0",
+            "version": "9.4.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2336,7 +2336,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "9.3.0",
+        "version": "9.4.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -2519,11 +2519,100 @@ def _candidate_related_page(page, candidate):
     return bool(candidate_key and candidate_key in _candidate_key(page_text))
 
 
-def validate_content_sources_and_links(content, candidate_record, workflow):
-    """Validate citation provenance, public-page reachability and obvious CTA mismatch.
+def _classify_source_url(url, candidate_record, page_metadata=None):
+    """Classify a source URL by observable host/path metadata, not legal ownership."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    candidate = str(candidate_record.get("candidate", "")).strip().lower()
+    candidate_slug = re.sub(r"[^a-z0-9]", "", candidate)
+    host_slug = re.sub(r"[^a-z0-9]", "", host.split(":")[0])
+    path = (parsed.path or "").lower()
+    title = str((page_metadata or {}).get("title", "")).lower()
 
-    This check does not claim semantic fact verification: a reachable URL or a
-    matching domain is not proof that the page supports a particular sentence.
+    if any(term in host for term in ("impact.com", "partnerize.com", "cj.com", "awin.com", "shareasale.com")):
+        category = "affiliate_network"
+    elif any(term in path for term in ("/affiliate", "/affiliates", "/partner", "/partnership", "/referral", "/ambassador")):
+        category = "candidate_affiliate_or_partner_page" if candidate_slug and candidate_slug in host_slug else "partner_or_affiliate_page"
+    elif any(term in path for term in ("/blog", "/news", "/press", "/articles")) or "blog" in title:
+        category = "blog_or_editorial"
+    elif candidate_slug and candidate_slug in host_slug:
+        category = "candidate_host_page"
+    else:
+        category = "third_party_source"
+
+    return {
+        "url": url,
+        "host": host,
+        "category": category,
+        "legal_ownership_verified": False,
+        "note": "Classification is based on URL host/path metadata only; it does not establish legal ownership or factual support."
+    }
+
+
+def _content_claim_sentences(content):
+    """Conservative extraction of likely factual sentences for human source review."""
+    claims = []
+    for line in str(content or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("---"):
+            continue
+        # Ignore pure link/source inventory lines; CTA links are checked separately.
+        if stripped.lower().startswith(("sources used", "- `http", "* `http", "d. sources")):
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", stripped):
+            sentence = sentence.strip(" -*\t")
+            if len(sentence) < 48:
+                continue
+            if _MARKDOWN_LINK_RE.fullmatch(sentence):
+                continue
+            lower = sentence.lower()
+            factual_cues = re.search(
+                r"\b(is|are|was|were|has|have|offers?|provides?|includes?|features?|hosts?|focuses?|centers?|operates?|works?|typically|usually|most|many|each|all|every|ranges?|allows?|enables?|encourages?|requires?|costs?|contains?|launched|founded|managed|taught|designed|built)\b|\b\d+(?:[.,]\d+)?\s*(?:%|minutes?|hours?|days?|years?|classes|courses)\b",
+                lower
+            )
+            if factual_cues:
+                claims.append(sentence[:700])
+    # Stable de-duplication; keep the report bounded.
+    return list(dict.fromkeys(claims))[:60]
+
+
+def _claim_source_candidates(sentence, source_documents):
+    """Lexical overlap suggests candidate sources; it is not semantic verification."""
+    stop = {
+        "about", "after", "also", "and", "are", "because", "been", "being", "between",
+        "both", "can", "could", "does", "each", "from", "have", "into", "more", "most",
+        "other", "over", "such", "than", "that", "their", "them", "then", "there", "these",
+        "they", "this", "those", "through", "under", "using", "very", "what", "when", "where",
+        "which", "while", "with", "within", "would", "your", "you", "will", "were", "was",
+        "the", "for", "but", "not", "its", "our", "out", "per", "who", "how", "why"
+    }
+    def tokens(value):
+        return {w for w in re.findall(r"[a-z0-9]{4,}", str(value).lower()) if w not in stop}
+    claim_tokens = tokens(sentence)
+    if len(claim_tokens) < 3:
+        return []
+    matches = []
+    for source in source_documents:
+        source_tokens = tokens(source.get("text", ""))
+        if not source_tokens:
+            continue
+        overlap = claim_tokens & source_tokens
+        score = len(overlap) / max(1, len(claim_tokens))
+        if len(overlap) >= 3 and score >= 0.18:
+            matches.append({
+                "url": source.get("url"),
+                "overlap_score": round(score, 3),
+                "shared_terms": sorted(overlap)[:12],
+                "match_type": "lexical_candidate_only_not_semantic_verification"
+            })
+    return sorted(matches, key=lambda item: item["overlap_score"], reverse=True)[:3]
+
+
+def validate_content_sources_and_links(content, candidate_record, workflow):
+    """v9.4 source audit: provenance, URL class, claim candidates and CTA checks.
+
+    A lexical match is never reported as semantic verification. Any extracted
+    factual claim remains subject to human review unless a reviewer confirms it.
     """
     text = str(content or "")
     candidate = candidate_record.get("candidate", "")
@@ -2534,7 +2623,6 @@ def validate_content_sources_and_links(content, candidate_record, workflow):
 
     evidence_urls = set(_walk_urls(candidate_record))
     report_urls = set(_walk_urls(verification_report))
-    # Other reports are allowed only as candidate-specific leads, not as official proof.
     related_report_urls = set()
     candidate_key = _candidate_key(candidate)
     for report_text in (competition_report, financial_report, strategy_report):
@@ -2546,45 +2634,84 @@ def validate_content_sources_and_links(content, candidate_record, workflow):
     for page in matching_pages:
         page_urls.update(_walk_urls(page))
 
-    # The verification report is candidate-scoped by the workflow's selected ledger record.
     allowed_urls = evidence_urls | report_urls | page_urls | related_report_urls
     normalized_allowed = {_clean_url(url) for url in allowed_urls if _clean_url(url)}
-
     content_urls = list(dict.fromkeys(_clean_url(u) for u in _walk_urls(text)))
     findings = []
     source_checks = []
+    source_documents = []
     checked_pages = {}
 
+    # Inspect only URLs already present in this candidate's workflow evidence.
     for url in content_urls[:8]:
         if url not in normalized_allowed:
             findings.append({
-                "type": "unsupported_source_reference",
-                "url": url,
+                "type": "unsupported_source_reference", "url": url,
                 "severity": "review_required",
                 "reason": "URL was not found in the selected candidate's Evidence Ledger or candidate-specific workflow reports."
             })
             continue
-        # Fetch only candidate-scoped, already supplied URLs. Fetch failures are not treated as proof of invalidity.
         if url not in checked_pages:
             checked_pages[url] = inspect_public_page(url)
         page_result = checked_pages[url]
+        classification = _classify_source_url(url, candidate_record, page_result)
         source_checks.append({
-            "url": url,
-            "provenance": "candidate_workflow_evidence",
+            **classification,
             "page_status": page_result.get("status", "unknown"),
             "page_title": page_result.get("title", ""),
             "final_url": page_result.get("final_url", ""),
-            "note": "Reachability and page metadata only; semantic support for individual claims requires human review."
+            "note": "Reachability and metadata only; page text is used solely to suggest possible claim-source matches."
         })
-        if page_result.get("status") != "inspected":
-            findings.append({
-                "type": "source_unreachable_or_uninspected",
+        if page_result.get("status") == "inspected":
+            source_documents.append({
                 "url": url,
+                "text": " ".join([
+                    page_result.get("title", ""), page_result.get("description", ""),
+                    page_result.get("text_excerpt", "")
+                ])
+            })
+        else:
+            findings.append({
+                "type": "source_unreachable_or_uninspected", "url": url,
                 "severity": "review_required",
                 "reason": page_result.get("reason", page_result.get("status", "Page could not be inspected."))
             })
 
-    # Remove links that are not grounded in this candidate's workflow evidence.
+    # Also use already-inspected official-site evidence without making more network requests.
+    for page in matching_pages:
+        page_url = _clean_url(page.get("final_url") or page.get("requested_url") or "")
+        page_text = " ".join([page.get("title", ""), page.get("description", ""), page.get("text_excerpt", "")])
+        if page_url and page_text and not any(item.get("url") == page_url for item in source_documents):
+            source_documents.append({"url": page_url, "text": page_text})
+
+    # Classify all URLs cited in the content, including source-list URLs.
+    source_classifications = [
+        _classify_source_url(url, candidate_record, checked_pages.get(url, {}))
+        for url in content_urls if url in normalized_allowed
+    ]
+
+    claims = _content_claim_sentences(text)
+    claim_mappings = []
+    unsupported_claims = []
+    for index, claim in enumerate(claims, start=1):
+        matches = _claim_source_candidates(claim, source_documents)
+        item = {
+            "claim_id": f"C{index:02d}",
+            "claim": claim,
+            "candidate_source_matches": matches,
+            "status": "candidate_source_match_requires_human_semantic_review" if matches else "no_candidate_source_match_human_verification_required"
+        }
+        claim_mappings.append(item)
+        if not matches:
+            unsupported_claims.append(item)
+
+    # Annotate un-matched extracted factual sentences in the draft for editors.
+    for item in unsupported_claims:
+        original = item["claim"]
+        if original in text:
+            text = text.replace(original, original + " [SOURCE VERIFICATION REQUIRED]", 1)
+
+    # Strip hyperlinks not grounded in the selected candidate's workflow evidence.
     def strip_unsupported_link(match):
         label, raw_url = match.group(1), _clean_url(match.group(2))
         if raw_url not in normalized_allowed:
@@ -2592,45 +2719,84 @@ def validate_content_sources_and_links(content, candidate_record, workflow):
         return match.group(0)
     text = _MARKDOWN_LINK_RE.sub(strip_unsupported_link, text)
 
-    # Flag an obvious mismatch: a learner-facing CTA should not send users to an affiliate application page.
+    # CTA check: identify learner-facing CTA anchors and classify destination.
+    cta_findings = []
+    cta_links = []
     for label, raw_url in _MARKDOWN_LINK_RE.findall(text):
         anchor = label.lower()
         path = urlparse(raw_url).path.lower()
-        learner_cta = bool(re.search(r"\b(?:learn more|explore|browse|view|discover|classes|courses|start learning)\b", anchor))
-        partner_destination = any(term in path for term in ("affiliate", "partner", "referral", "ambassador"))
+        learner_cta = bool(re.search(r"\b(?:learn more|explore|browse|view|discover|classes|courses|start learning|visit the official)\b", anchor))
+        partner_destination = any(term in path for term in ("affiliate", "affiliates", "partner", "partnership", "referral", "ambassador"))
+        classification = _classify_source_url(raw_url, candidate_record, checked_pages.get(raw_url, {}))
+        cta_item = {
+            "anchor_text": label,
+            "url": raw_url,
+            "destination_category": classification["category"],
+            "learner_facing_cta": learner_cta,
+            "destination_appears_partner_focused": partner_destination
+        }
+        cta_links.append(cta_item)
         if learner_cta and partner_destination:
-            findings.append({
-                "type": "cta_destination_mismatch",
-                "url": raw_url,
-                "anchor_text": label,
-                "severity": "review_required",
-                "reason": "Learner-facing CTA points to a partner/affiliate information path rather than an obvious learner destination."
+            cta_findings.append({
+                "type": "cta_destination_mismatch", "url": raw_url,
+                "anchor_text": label, "severity": "review_required",
+                "reason": "Learner-facing CTA points to an affiliate/partner path, not a clearly learner-facing destination."
             })
+    if not cta_links:
+        cta_findings.append({
+            "type": "cta_missing_or_not_linked", "severity": "review_required",
+            "reason": "No linked CTA was detected; confirm that the intended call to action has a relevant destination."
+        })
+    findings.extend(cta_findings)
 
-    # Source list entries should be candidate-specific and grounded in the workflow.
+    # Source list entries must be candidate-specific evidence URLs.
     source_section = re.search(r"(?ims)^\s*(?:#{1,6}\s*)?(?:D\.?\s*)?Sources used.*?(?=^\s*(?:#{1,6}\s*)?(?:E\.?\s*)|\Z)", text)
     if source_section:
         for url in list(dict.fromkeys(_clean_url(u) for u in _walk_urls(source_section.group(0)))):
             if url not in normalized_allowed:
                 findings.append({
-                    "type": "unattributed_source_list_entry",
-                    "url": url,
+                    "type": "unattributed_source_list_entry", "url": url,
                     "severity": "review_required",
                     "reason": "Listed source is not present in the selected candidate's evidence or candidate-specific reports."
                 })
 
+    total_claims = len(claim_mappings)
+    matched_claims = sum(1 for item in claim_mappings if item["candidate_source_matches"])
+    # Score is audit coverage only; it is not a truth or semantic accuracy score.
+    provenance_score = 100 if all(url in normalized_allowed for url in content_urls) else (0 if content_urls else 50)
+    claim_coverage_score = round((matched_claims / total_claims) * 100) if total_claims else 0
+    cta_score = 100 if cta_links and not cta_findings else (50 if cta_links else 0)
+    audit_score = round(provenance_score * 0.25 + claim_coverage_score * 0.50 + cta_score * 0.25)
+
     return text, {
-        "status": "review_required" if findings else "passed",
+        "status": "review_required",
+        "audit_score": audit_score,
+        "audit_score_meaning": "Evidence-audit coverage indicator only; it is not a factual accuracy score and cannot replace human review.",
         "candidate": candidate,
         "content_urls_found": len(content_urls),
         "candidate_evidence_urls_available": len(normalized_allowed),
         "source_pages_checked": source_checks,
+        "source_classifications": source_classifications,
+        "claim_to_source_mapping": {
+            "claims_extracted": total_claims,
+            "claims_with_candidate_source_matches": matched_claims,
+            "claims_without_candidate_source_matches": len(unsupported_claims),
+            "claims": claim_mappings,
+            "note": "Lexical overlap only suggests candidate sources. It does not prove that a source semantically supports a claim. Human review remains mandatory."
+        },
+        "cta_destination_check": {
+            "status": "review_required" if cta_findings else "candidate_check_passed_human_confirmation_required",
+            "links": cta_links,
+            "findings": cta_findings
+        },
         "findings_count": len(findings),
         "findings": findings,
         "limitations": [
             "A URL being present in the workflow does not prove that it supports a specific factual claim.",
-            "Page reachability and title metadata are not semantic fact-checking.",
-            "Human review is required for claim-to-source matching and CTA suitability."
+            "Lexical claim-to-source matching is a discovery aid, not semantic fact verification.",
+            "URL classification uses host/path metadata and does not prove legal domain ownership.",
+            "CTA suitability requires human confirmation, even when no obvious mismatch is detected.",
+            "This module never marks factual claims as semantically verified automatically."
         ]
     }
 
@@ -2674,9 +2840,9 @@ def run_content_creation_agent(request: ContentCreationRequest):
 
     selected_record = json.dumps(selected, ensure_ascii=False, indent=2)
     prompt = f"""
-You are the Content Creation Agent, Agent 6 of Affiliate Intelligence v9.3.
+You are the Content Creation Agent, Agent 6 of Affiliate Intelligence v9.4.
 Create ONE polished, useful, original marketing content asset for human review.
-SOURCE ATTRIBUTION RULES
+SOURCE ATTRIBUTION AND CLAIM REVIEW RULES
 - Every URL in the Sources Used section must be present in the selected candidate's evidence record or candidate-specific workflow reports.
 - Do not invent, reconstruct, or substitute URLs. Use the most relevant destination for the audience's CTA; an affiliate application page is not a learner-facing classes page.
 - Do not imply that a source supports a claim unless its supplied excerpt directly supports that claim. If excerpts are absent, mark the claim for human source review.
@@ -2750,7 +2916,7 @@ structure to the requested content type. Return the result in {request.language}
     return {
         "status": "draft_created",
         "project": "Affiliate Intelligence",
-        "version": "9.3.0",
+        "version": "9.4.0",
         "agent": "Content Creation Agent",
         "candidate": request.candidate,
         "content_type": request.content_type,
@@ -2769,7 +2935,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "9.3.0",
+        "version": "9.4.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 6
