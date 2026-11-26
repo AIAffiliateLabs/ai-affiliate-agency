@@ -27,7 +27,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="9.6.0"
+    version="9.7.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -1250,8 +1250,8 @@ def _line_has_unsupported_term_claim(line, candidate):
 def _normalize_report_version(report_text):
     """Normalize stale platform version labels in generated agent prose."""
     text = str(report_text or "")
-    pattern = r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|\bversion\s+|\bv)(?:8\.\d+(?:\.\d+)?|9\.[0-5](?:\.\d+)?)\b"
-    return re.sub(pattern, lambda m: m.group(1) + "9.6.0", text)
+    pattern = r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|\bversion\s+|\bv)(?:8\.\d+(?:\.\d+)?|9\.[0-6](?:\.\d+)?)\b"
+    return re.sub(pattern, lambda m: m.group(1) + "9.7.0", text)
 
 
 def _sanitize_agent_report(report_text, records, agent_name):
@@ -1471,12 +1471,12 @@ def build_agent_consistency_audit(records, agent_reports):
 def build_report_metadata(agent_reports):
     """Report stale agent version labels without silently treating them as evidence issues."""
     stale = []
-    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)(?:8\.\d+(?:\.\d+)?|9\.[0-5](?:\.\d+)?)\b")
+    version_pattern = re.compile(r"(?i)\b(?:Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|version\s+|v)(?:8\.\d+(?:\.\d+)?|9\.[0-6](?:\.\d+)?)\b")
     for agent_name, report in (agent_reports or {}).items():
         if version_pattern.search(str(report or "")):
             stale.append(agent_name)
     return {
-        "application_version": "9.6.0",
+        "application_version": "9.7.0",
         "agent_reports_with_stale_version_labels": stale,
         "status": "passed" if not stale else "review_required",
         "version_policy": "All agent prompts and generated report version labels must match the running application version."
@@ -1535,7 +1535,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 9.6.0.
+You are the Market Discovery Agent of Affiliate Intelligence, version 9.7.0.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1660,7 +1660,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 9.6.0.
+You are the Verification Agent of Affiliate Intelligence, version 9.7.0.
 
 V8 STRICT EVIDENCE RULES:
 - The structured ledger is deterministic and authoritative; do not upgrade it.
@@ -2237,7 +2237,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.6.0",
+            "version": "9.7.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2276,7 +2276,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.6.0",
+            "version": "9.7.0",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2337,7 +2337,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "9.6.0",
+        "version": "9.7.0",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -3005,17 +3005,45 @@ def _validate_user_tracking_url(raw_url):
     return value
 
 
-def build_seo_quality_check(content, primary_keyword=""):
-    """Check presence and basic formatting of the requested SEO package, not ranking potential."""
+def extract_seo_package(content, primary_keyword=""):
+    """Extract SEO metadata from common labels without inventing missing values."""
     text = str(content or "")
-    def extract(label):
-        match = re.search(rf"(?im)^\s*(?:[-*]\s*)?{re.escape(label)}\s*:\s*(.+?)\s*$", text)
-        return match.group(1).strip().strip('`"') if match else ""
-    seo_title = extract("SEO title")
-    meta = extract("Meta description")
-    slug = extract("URL slug")
-    keyword = str(primary_keyword or extract("Primary keyword")).strip()
-    h1_count = len(re.findall(r"(?m)^#\s+\S", text))
+    labels = {
+        "seo_title": ("SEO title", "Suggested Meta Title", "Meta Title", "SEO Title"),
+        "meta_description": ("Meta description", "Suggested Meta Description", "Meta Description"),
+        "url_slug": ("URL slug", "Suggested URL Slug", "Slug"),
+        "search_intent": ("Search intent", "Search Intent"),
+        "secondary_keywords": ("Secondary keywords", "Secondary Keywords"),
+        "primary_keyword": ("Primary keyword", "Primary SEO Keyword")
+    }
+    extracted = {}
+    for field, variants in labels.items():
+        value = ""
+        for label in variants:
+            match = re.search(
+                rf"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?\s*:\s*(.+?)\s*$",
+                text
+            )
+            if match:
+                value = match.group(1).strip()
+                value = re.sub(r"^\*\*\s*", "", value)
+                value = re.sub(r"\s*\*\*$", "", value)
+                value = value.strip().strip('`"\'')
+                break
+        extracted[field] = value
+    if primary_keyword:
+        extracted["primary_keyword"] = str(primary_keyword).strip()
+    return extracted
+
+
+def build_seo_quality_check(content, primary_keyword=""):
+    """Check SEO package presence and basic formatting; not ranking potential."""
+    package = extract_seo_package(content, primary_keyword)
+    seo_title = package["seo_title"]
+    meta = package["meta_description"]
+    slug = package["url_slug"]
+    keyword = package["primary_keyword"]
+    h1_count = len(re.findall(r"(?m)^#\s+\S", str(content or "")))
     checks = {
         "seo_title_present": bool(seo_title),
         "seo_title_length_30_to_60": bool(seo_title) and 30 <= len(seo_title) <= 60,
@@ -3034,9 +3062,11 @@ def build_seo_quality_check(content, primary_keyword=""):
         "meta_description": meta or "Not detected",
         "meta_description_characters": len(meta),
         "url_slug": slug or "Not detected",
+        "search_intent": package["search_intent"] or "Not detected",
+        "secondary_keywords": package["secondary_keywords"] or "Not detected",
         "h1_heading_count": h1_count,
         "checks": checks,
-        "limitation": "These are formatting and presence checks only. They do not guarantee search rankings, search volume, keyword difficulty, or SEO performance."
+        "limitation": "These are formatting and presence checks only. They do not guarantee search rankings, search volume, keyword difficulty, traffic or SEO performance."
     }
 
 
@@ -3219,6 +3249,20 @@ structure to the requested content type. Return the result in {request.language}
     if readiness["status"] != "READY_FOR_HUMAN_APPROVAL":
         quality_control["status"] = "review_required"
     seo_quality = build_seo_quality_check(result, request.primary_keyword)
+    # CTA assessment is intentionally conservative: only classify the supplied URL/path;
+    # never guess or construct a learner-facing destination.
+    cta_audit = source_link_quality.get("cta_destination_check", {})
+    cta_links = cta_audit.get("links", []) if isinstance(cta_audit, dict) else []
+    cta_summary = {
+        "status": cta_audit.get("status", "not_detected") if isinstance(cta_audit, dict) else "not_detected",
+        "links_checked": len(cta_links),
+        "learner_facing_destination_confirmed": bool(cta_links) and all(
+            not item.get("destination_appears_partner_focused", False)
+            and item.get("destination_category") not in ("candidate_affiliate_or_partner_page", "affiliate_network")
+            for item in cta_links
+        ),
+        "note": "The system does not invent a destination. If only an affiliate/partner application URL is available, use an explicitly labelled partner-program CTA or supply a verified learner-facing URL in the evidence."
+    }
     tracking_status = {
         "status": "user_supplied_unverified" if tracking_url else "not_configured",
         "url": tracking_url or None,
@@ -3230,7 +3274,7 @@ structure to the requested content type. Return the result in {request.language}
     return {
         "status": "draft_created",
         "project": "Affiliate Intelligence",
-        "version": "9.6.0",
+        "version": "9.7.0",
         "agent": "Content Creation Agent",
         "candidate": request.candidate,
         "content_type": request.content_type,
@@ -3238,6 +3282,8 @@ structure to the requested content type. Return the result in {request.language}
         "human_approval_required": True,
         "may_publish": False,
         "seo_quality_check": seo_quality,
+        "seo_package": extract_seo_package(result, request.primary_keyword),
+        "cta_intelligence": cta_summary,
         "affiliate_link_integration": tracking_status,
         "revision_loop": revision_info,
         "content_quality_control": quality_control,
@@ -3253,7 +3299,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "9.6.0",
+        "version": "9.7.0",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 6
