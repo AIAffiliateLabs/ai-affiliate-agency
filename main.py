@@ -27,7 +27,7 @@ from ddgs import DDGS
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="9.9.0"
+    version="9.9.1"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -1251,7 +1251,7 @@ def _normalize_report_version(report_text):
     """Normalize stale platform version labels in generated agent prose."""
     text = str(report_text or "")
     pattern = r"(?i)(Affiliate Intelligence(?: System)?\s*,?\s*(?:version|v)\s*|\bversion\s+|\bv)(?:8\.\d+(?:\.\d+)?|9\.[0-6](?:\.\d+)?)\b"
-    return re.sub(pattern, lambda m: m.group(1) + "9.8.0", text)
+    return re.sub(pattern, lambda m: m.group(1) + "9.9.1", text)
 
 
 def _sanitize_agent_report(report_text, records, agent_name):
@@ -1476,7 +1476,7 @@ def build_report_metadata(agent_reports):
         if version_pattern.search(str(report or "")):
             stale.append(agent_name)
     return {
-        "application_version": "9.8.0",
+        "application_version": "9.9.1",
         "agent_reports_with_stale_version_labels": stale,
         "status": "passed" if not stale else "review_required",
         "version_policy": "All agent prompts and generated report version labels must match the running application version."
@@ -1535,7 +1535,7 @@ FOCUSED DISCOVERY MODE:
 """
 
     prompt = f"""
-You are the Market Discovery Agent of Affiliate Intelligence, version 9.8.0.
+You are the Market Discovery Agent of Affiliate Intelligence, version 9.9.1.
 
 REPORT DATE (UTC): {datetime.now(timezone.utc).date().isoformat()}
 
@@ -1660,7 +1660,7 @@ def run_verification_agent(discovery_report, candidate_searches, official_site_e
     structured_data = _records_json(structured_evidence_records)
 
     prompt = f"""
-You are the Verification Agent of Affiliate Intelligence, version 9.8.0.
+You are the Verification Agent of Affiliate Intelligence, version 9.9.1.
 
 V8 STRICT EVIDENCE RULES:
 - The structured ledger is deterministic and authoritative; do not upgrade it.
@@ -2237,7 +2237,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.8.0",
+            "version": "9.9.1",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2276,7 +2276,7 @@ def run_agent_workflow(request: ResearchRequest):
         return {
             "status": "partial",
             "project": "Affiliate Intelligence",
-            "version": "9.8.0",
+            "version": "9.9.1",
             "report_generated_at_utc": report_generated_at_utc,
             "workflow": "Five-Agent Research Workflow + On-Demand Content Creation Agent",
             "model": MODEL_NAME,
@@ -2337,7 +2337,7 @@ def run_agent_workflow(request: ResearchRequest):
     return {
         "status": "success",
         "project": "Affiliate Intelligence",
-        "version": "9.8.0",
+        "version": "9.9.1",
         "evidence_enforcement": enforcement_summary,
         "agent_consistency_audit": agent_consistency_audit,
         "report_metadata": build_report_metadata({
@@ -3374,7 +3374,7 @@ structure to the requested content type. Return the result in {request.language}
     return {
         "status": "draft_created",
         "project": "Affiliate Intelligence",
-        "version": "9.9.0",
+        "version": "9.9.1",
         "agent": "Content Creation Agent",
         "candidate": request.candidate,
         "content_type": request.content_type,
@@ -3407,7 +3407,7 @@ def home():
     return {
         "status": "online",
         "project": "Affiliate Intelligence",
-        "version": "9.8.0",
+        "version": "9.9.1",
         "ai_model": MODEL_NAME,
         "web_research": "enabled",
         "agents": 6
