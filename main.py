@@ -21,13 +21,13 @@ from ddgs import DDGS
 
 # ==========================================
 # APPLICATION SETTINGS
-# v9.6: adds SEO packaging, optional user-supplied affiliate tracking links, and an opt-in single-pass content revision loop; preserves v9.5 evidence and publishing gates.
+# v9.9: separates public content from internal QA/source notes with fail-closed handling; preserves v9.8 evidence, SEO, tracking and human-approval gates.
 # ==========================================
 
 app = FastAPI(
     title="Affiliate Intelligence",
     description="AI-powered affiliate research, merchant discovery and verification platform",
-    version="9.8.0"
+    version="9.9.0"
 )
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -3122,6 +3122,56 @@ DRAFT:
 
 
 # ==========================================
+# v9.9 PUBLIC / INTERNAL CONTENT SEPARATION
+# ==========================================
+
+def separate_public_and_internal_content(raw_content):
+    """Separate the audience-facing draft from QA notes and source disclosures.
+
+    Fail closed: if the expected internal-review boundary is missing, return no
+    publishable body and preserve the entire response for internal human review.
+    This is formatting isolation, not factual verification.
+    """
+    raw = str(raw_content or "").strip()
+    if not raw:
+        return {
+            "public_content": "",
+            "internal_review": "",
+            "separation_status": "empty_content_blocked",
+            "boundary_found": False,
+        }
+
+    boundary = re.search(
+        r"(?im)^\s*(?:D\s*[.)]|D\s*[-:])\s*(?:sources\s+used|sources|source\s+list)\b",
+        raw,
+    )
+    if not boundary:
+        return {
+            "public_content": "",
+            "internal_review": raw,
+            "separation_status": "review_boundary_missing_fail_closed",
+            "boundary_found": False,
+        }
+
+    public_part = raw[:boundary.start()].strip()
+    internal_part = raw[boundary.start():].strip()
+    if not public_part:
+        return {
+            "public_content": "",
+            "internal_review": raw,
+            "separation_status": "public_section_empty_fail_closed",
+            "boundary_found": True,
+        }
+
+    return {
+        "public_content": public_part,
+        "internal_review": internal_part,
+        "separation_status": "separated_review_required",
+        "boundary_found": True,
+    }
+
+
+# ==========================================
 # AGENT 6 — CONTENT CREATION
 # ==========================================
 
@@ -3161,7 +3211,7 @@ def run_content_creation_agent(request: ContentCreationRequest):
 
     selected_record = json.dumps(selected, ensure_ascii=False, indent=2)
     prompt = f"""
-You are the Content Creation Agent, Agent 6 of Affiliate Intelligence v9.8.
+You are the Content Creation Agent, Agent 6 of Affiliate Intelligence v9.9.
 Create ONE polished, useful, original marketing content asset for human review.
 SOURCE ATTRIBUTION AND CLAIM REVIEW RULES
 - Every URL in the Sources Used section must be present in the selected candidate's evidence record or candidate-specific workflow reports.
@@ -3310,10 +3360,21 @@ structure to the requested content type. Return the result in {request.language}
         "human_confirmation_required": True,
         "note": "The system does not create affiliate links or claim that a supplied tracking link works. Confirm it in the affiliate network before use."
     }
+    separated = separate_public_and_internal_content(result)
+    # A missing boundary fails closed: never expose an unclassified response as
+    # audience-facing copy. Even a clean separation does not clear factual claims.
+    if separated["separation_status"] != "separated_review_required":
+        readiness.setdefault("blockers", []).append(
+            "Public/internal content boundary could not be safely identified; manual restructuring is required."
+        )
+        readiness["status"] = "BLOCKED_PENDING_REVIEW"
+        readiness["may_publish"] = False
+        quality_control["status"] = "review_required"
+
     return {
         "status": "draft_created",
         "project": "Affiliate Intelligence",
-        "version": "9.8.0",
+        "version": "9.9.0",
         "agent": "Content Creation Agent",
         "candidate": request.candidate,
         "content_type": request.content_type,
@@ -3326,7 +3387,15 @@ structure to the requested content type. Return the result in {request.language}
         "affiliate_link_integration": tracking_status,
         "revision_loop": revision_info,
         "content_quality_control": quality_control,
-        "content": result
+        "content": separated["public_content"],
+        "public_content": separated["public_content"],
+        "internal_review": separated["internal_review"],
+        "content_separation": {
+            "status": separated["separation_status"],
+            "boundary_found": separated["boundary_found"],
+            "note": "Separation only keeps QA/source notes out of the audience-facing field. It does not verify claims or authorize publishing."
+        },
+        "publishing_readiness": readiness
     }
 
 # ==========================================
